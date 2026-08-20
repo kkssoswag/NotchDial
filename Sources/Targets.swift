@@ -46,10 +46,31 @@ enum IconCache {
 }
 
 enum Launcher {
-    // Dock-click semantics: activate if running, launch if not.
+    static var timing = false
+
+    // Dock-click semantics, but instant: snap an already-running app frontmost
+    // synchronously, then let LaunchServices handle launch/reopen behind it.
     static func launch(_ t: AppTarget) {
+        let url = URL(fileURLWithPath: t.path)
+        let t0 = Date()
+        if timing {
+            var obs: NSObjectProtocol?
+            obs = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { n in
+                guard let a = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                      a.bundleURL == url else { return }
+                print("LAUNCH LATENCY \(t.name): \(Int(Date().timeIntervalSince(t0) * 1000)) ms")
+                if let o = obs { NSWorkspace.shared.notificationCenter.removeObserver(o) }
+            }
+        }
+        if let running = NSWorkspace.shared.runningApplications.first(where: { $0.bundleURL == url }) {
+            running.activate(options: [.activateAllWindows])
+            if timing { print("PATH: fast activate (already running)") }
+        } else if timing {
+            print("PATH: cold launch via LaunchServices")
+        }
         let cfg = NSWorkspace.OpenConfiguration()
         cfg.activates = true
-        NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: t.path), configuration: cfg, completionHandler: nil)
+        NSWorkspace.shared.openApplication(at: url, configuration: cfg, completionHandler: nil)
     }
 }

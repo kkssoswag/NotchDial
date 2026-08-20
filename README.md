@@ -37,7 +37,7 @@ Targets currently live in `Sources/Targets.swift` (name / bundle path / brand ti
 
 ## Debug flags
 
-`--pin` keep expanded · `--snap out.png` offscreen snapshot · `--film dir/` frame-by-frame capture · `--selftest` gesture engine tests · `--clicktest` synthesized-click hit-testing test
+`--pin` keep expanded · `--snap out.png` offscreen snapshot · `--film dir/` frame-by-frame capture · `--selftest` gesture engine tests · `--clicktest` synthesized-click hit-testing test · `--launchtest` measures click→app-activation latency
 
 ## License
 

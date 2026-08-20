@@ -217,11 +217,8 @@ struct TicketView: View {
         .contentShape(Rectangle())
         .onTapGesture {
             guard !torn, state.phase == .expanded else { return }
-            NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .default)
             phys.tear(i)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
-                onLaunch(tg)
-            }
+            onLaunch(tg)   // instant launch — tear animation plays while the app comes up
         }
         .onHover { h in
             if h { hoverTicket = i } else if hoverTicket == i { hoverTicket = -1 }

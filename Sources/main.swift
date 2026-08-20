@@ -142,6 +142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if pinned { expand() }
         if CommandLine.arguments.contains("--clicktest") {
             dryLaunch = true
+            enabled = false   // deterministic: the real cursor must not collapse the island mid-test
             expand()
             let xs: [CGFloat] = [165, 235, 305]
             for (k, x) in xs.enumerated() {
@@ -159,9 +160,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 5.4) { NSApp.terminate(nil) }
         }
+        if CommandLine.arguments.contains("--launchtest") {
+            Launcher.timing = true
+            enabled = false
+            expand()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self = self else { return }
+                self.launch(kTargets[self.state.centeredIndex])
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { NSApp.terminate(nil) }
+        }
         if let fi = CommandLine.arguments.firstIndex(of: "--film"), fi + 1 < CommandLine.arguments.count {
             let dir = CommandLine.arguments[fi + 1]
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            enabled = false
             expand()
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                 self?.step(1)
@@ -182,6 +194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if let i = CommandLine.arguments.firstIndex(of: "--snap"), i + 1 < CommandLine.arguments.count {
             let path = CommandLine.arguments[i + 1]
+            enabled = false
             expand()
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.3) { [weak self] in
                 if let v = self?.panel?.contentView,
@@ -369,11 +382,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if dryLaunch { print("CLICK->\(t.name)"); return }
         guard state.phase == .expanded else { return }
         NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .default)
+        Launcher.launch(t)   // fire immediately — the app switches while the animation plays on top
         withAnimation(.easeIn(duration: 0.30)) { state.phase = .launching }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
-            Launcher.launch(t)
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.46) { [weak self] in
+        let linger = state.mode == 2 ? 0.72 : 0.46   // ticket mode: let the torn stub fall clear
+        DispatchQueue.main.asyncAfter(deadline: .now() + linger) { [weak self] in
             guard let self = self, !self.pinned else { self?.state.phase = .expanded; return }
             self.collapse()
         }
