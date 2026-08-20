@@ -170,6 +170,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { NSApp.terminate(nil) }
         }
+        if let di = CommandLine.arguments.firstIndex(of: "--demo"), di + 1 < CommandLine.arguments.count {
+            let m = Int(CommandLine.arguments[di + 1]) ?? 2
+            dryLaunch = true
+            enabled = false
+            state.mode = m
+            func synthClick(_ xIsland: CGFloat, _ yTop: CGFloat, after t: Double) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + t) { [weak self] in
+                    guard let self = self, let p = self.panel else { return }
+                    let pt = NSPoint(x: (p.frame.width - 470) / 2 + xIsland, y: p.frame.height - yTop)
+                    let ts = ProcessInfo.processInfo.systemUptime
+                    if let dn = NSEvent.mouseEvent(with: .leftMouseDown, location: pt, modifierFlags: [],
+                                                   timestamp: ts, windowNumber: p.windowNumber, context: nil,
+                                                   eventNumber: 0, clickCount: 1, pressure: 1) { p.sendEvent(dn) }
+                    if let up = NSEvent.mouseEvent(with: .leftMouseUp, location: pt, modifierFlags: [],
+                                                   timestamp: ts + 0.05, windowNumber: p.windowNumber, context: nil,
+                                                   eventNumber: 0, clickCount: 1, pressure: 1) { p.sendEvent(up) }
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.expand() }
+            if m == 2 {
+                synthClick(165, 150, after: 2.2)
+                synthClick(235, 150, after: 3.6)
+                synthClick(305, 150, after: 5.0)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 6.4) { [weak self] in self?.collapse() }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 7.4) { NSApp.terminate(nil) }
+            } else if m == 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [weak self] in self?.step(1) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.8) { [weak self] in self?.step(1) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5.2) { [weak self] in self?.step(-1) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 6.6) { [weak self] in self?.collapse() }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 7.6) { NSApp.terminate(nil) }
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.9) { [weak self] in self?.step(1) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { [weak self] in self?.step(1) }
+                synthClick(235, 120, after: 5.1)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 6.3) { [weak self] in self?.collapse() }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 7.2) { NSApp.terminate(nil) }
+            }
+        }
         if let fi = CommandLine.arguments.firstIndex(of: "--film"), fi + 1 < CommandLine.arguments.count {
             let dir = CommandLine.arguments[fi + 1]
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)

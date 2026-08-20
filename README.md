@@ -70,7 +70,7 @@ Targets live in `Sources/Targets.swift` (name / bundle path / brand tint / plane
 
 ## Debug flags
 
-`--pin` keep expanded · `--snap out.png` offscreen snapshot · `--film dir/` frame-by-frame capture · `--selftest` gesture engine tests · `--clicktest` synthesized-click hit-testing test · `--launchtest` measures click→app-activation latency
+`--pin` keep expanded · `--snap out.png` offscreen snapshot · `--film dir/` frame-by-frame capture · `--selftest` gesture engine tests · `--clicktest` synthesized-click hit-testing test · `--launchtest` measures click→app-activation latency · `--demo <0|1|2>` scripted showcase run (for screen-recording demos)
 
 ## License
 
