@@ -4,6 +4,8 @@ Turn your MacBook notch into a playful switcher for your AI coding agents.
 
 Hover the notch, and switch between **Codex / Cursor / Claude** in one of three hand-crafted modes — a pocket universe, a neon sign, or a strip of tear-off tickets. Click, and the app is frontmost in ~12 ms.
 
+https://github.com/user-attachments/assets/39c76579-0f78-4b29-822e-a5045ef01156
+
 | Orbit · Black Hole | Tear Tickets |
 | --- | --- |
 | ![orbit](docs/demo-orbit.gif) | ![tickets](docs/demo-ticket.gif) |
