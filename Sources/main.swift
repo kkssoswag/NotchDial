@@ -51,7 +51,7 @@ final class IslandState: ObservableObject {
 }
 
 // MARK: - App delegate
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let state = IslandState()
     var panel: NSPanel?
     var geo: NotchGeometry?
@@ -392,7 +392,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         p.isOpaque = false
         p.backgroundColor = .clear
         p.hasShadow = false
-        p.level = .screenSaver
+        p.level = .statusBar   // above windows & the menu bar, below system menus/popovers so they never get click-blocked
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         p.isMovable = false
         p.hidesOnDeactivate = false
@@ -502,6 +502,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = NSImage(systemSymbolName: "capsule.portrait.fill", accessibilityDescription: "NotchDial")
         let menu = NSMenu()
+        menu.delegate = self
         let mo = NSMenuItem(title: "模式：星轨 · 黑洞", action: #selector(setModeOrbit(_:)), keyEquivalent: "1")
         mo.target = self
         let mn = NSMenuItem(title: "模式：霓虹招牌", action: #selector(setModeNeon(_:)), keyEquivalent: "2")
@@ -525,6 +526,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.menu = menu
         statusItem = item
         refreshModeChecks()
+    }
+
+    // the island must never sit under (or fight with) an open menu
+    func menuWillOpen(_ menu: NSMenu) {
+        if !pinned { collapse() }
     }
 
     func refreshModeChecks() {
