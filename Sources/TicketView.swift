@@ -6,6 +6,7 @@ final class TicketPhys: ObservableObject {
     // paper feed (root stays in the slot; this is how far the paper has fed out)
     var feed = [CGFloat](repeating: -300, count: 3)
     var feedV = [CGFloat](repeating: 0, count: 3)
+    var feedTarget = [CGFloat](repeating: 0, count: 3)   // 0 = fed out; negative = retracted into the slot
     // paper bend (0 at the root, grows toward the tip)
     var bend = [Double](repeating: 0, count: 3)
     var bendV = [Double](repeating: 0, count: 3)
@@ -24,7 +25,7 @@ final class TicketPhys: ObservableObject {
 
     func drop(len: CGFloat) {
         for i in 0..<3 {
-            feed[i] = -(len + 24); feedV[i] = 0
+            feed[i] = -(len + 24); feedV[i] = 0; feedTarget[i] = 0
             bend[i] = 0; bendV[i] = 0
             torn[i] = false; stubY[i] = 0; stubVY[i] = 0; stubA[i] = 0; stubVA[i] = 0
         }
@@ -50,6 +51,14 @@ final class TicketPhys: ObservableObject {
         start()
     }
 
+    func retract(len: CGFloat) {
+        for i in 0..<3 {
+            feedTarget[i] = -(len + 30)
+            feedV[i] = min(feedV[i], -60)   // upward kick so the pull-back starts instantly
+        }
+        start()
+    }
+
     func nudge(_ i: Int, _ imp: Double) {
         guard !torn[i] else { return }
         bendV[i] += imp
@@ -71,7 +80,10 @@ final class TicketPhys: ObservableObject {
         var active = false
         for i in 0..<3 {
             // paper feed: critically-ish damped so the root never detaches from the slot
-            let fy = -90.0 * Double(feed[i]) - 15.0 * Double(feedV[i])
+            let retracting = feedTarget[i] != 0
+            let kk = retracting ? 180.0 : 90.0
+            let cc = retracting ? 22.0 : 15.0
+            let fy = -kk * Double(feed[i] - feedTarget[i]) - cc * Double(feedV[i])
             feedV[i] += CGFloat(fy * dt)
             feed[i] += feedV[i] * CGFloat(dt)
             // bend sway
@@ -79,7 +91,7 @@ final class TicketPhys: ObservableObject {
             bend[i] += bendV[i] * dt
             if bend[i] > 0.065 { bend[i] = 0.065; bendV[i] = min(0, bendV[i]) }
             if bend[i] < -0.065 { bend[i] = -0.065; bendV[i] = max(0, bendV[i]) }
-            if abs(feed[i]) > 0.4 || abs(feedV[i]) > 0.4 || abs(bend[i]) > 0.003 || abs(bendV[i]) > 0.008 { active = true }
+            if abs(feed[i] - feedTarget[i]) > 0.4 || abs(feedV[i]) > 0.4 || abs(bend[i]) > 0.003 || abs(bendV[i]) > 0.008 { active = true }
             // stub fall
             if torn[i] && stubY[i] < 480 {
                 stubVY[i] += 1400 * CGFloat(dt)
@@ -139,7 +151,8 @@ struct TicketView: View {
         .clipped()
         .onAppear { lastPhase = state.phase; phys.drop(len: LEN) }
         .onChange(of: state.phase) { ph in
-            if ph == .expanded && lastPhase == .collapsed { phys.drop(len: LEN) }
+            if ph == .expanded && (lastPhase == .collapsed || lastPhase == .launching) { phys.drop(len: LEN) }
+            if ph == .launching { phys.retract(len: LEN) }   // pull the strips back the moment the app switches
             lastPhase = ph
         }
         .onContinuousHover(coordinateSpace: .local) { ph in
@@ -210,7 +223,7 @@ struct TicketView: View {
                 .frame(width: TW, height: STUBH)
                 .rotationEffect(.radians(torn ? phys.stubA[i] : 0))
                 .offset(x: torn ? sin(phys.stubY[i] * 0.02) * 10 : 0,
-                        y: MAINH + (torn ? phys.stubY[i] : 0))
+                        y: MAINH + (torn ? phys.stubY[i] - dy : 0))   // world-fixed: keeps falling while the strip retracts
                 .opacity(torn ? max(0, 1 - Double(phys.stubY[i]) / 340) : 1)
         }
         .frame(width: TW, height: LEN, alignment: .top)

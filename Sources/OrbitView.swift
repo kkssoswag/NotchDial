@@ -7,6 +7,7 @@ struct OrbitView: View {
     var onTap: (Int) -> Void
     @State private var ringT: CGFloat = -1
     @State private var hoverID: Int = -1
+    @State private var launched = false   // latch: once flying into the hole, never interpolate back
     @State private var sparks = SparkBox()
 
     private let W: CGFloat = 620
@@ -54,9 +55,12 @@ struct OrbitView: View {
         .frame(width: W, height: H)
         .onChange(of: state.phase) { ph in
             if ph == .launching {
+                launched = true
                 ringT = 0
                 withAnimation(.easeOut(duration: 0.55)) { ringT = 1 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.62) { ringT = -1 }
+            } else if ph == .expanded {
+                launched = false
             }
         }
     }
@@ -95,7 +99,8 @@ struct OrbitView: View {
         let s: CGFloat = 1 - 0.72 * u
         let alpha: Double = abs(d) >= 1.0 ? 0 : (u < 0.72 ? 1 : max(0, 1 - Double((u - 0.72) / 0.26)))
         let isCenter = abs(d) < 0.5
-        let launchingMe = state.phase == .launching && isCenter
+        let sess = state.phase == .launching || launched
+        let launchingMe = sess && isCenter
         let size: CGFloat = 92 * s
         let morph = morphAmount(u)
         VStack(spacing: 7) {
@@ -146,7 +151,7 @@ struct OrbitView: View {
         }
         .allowsHitTesting(isCenter)
         .scaleEffect(x: launchingMe ? 0.22 : 1, y: launchingMe ? 2.6 : 1)
-        .opacity(launchingMe ? 0 : alpha)
+        .opacity(sess ? 0 : alpha)   // on launch everything dissolves; nothing ever falls back
         .blur(radius: u * 1.1)
         .position(x: launchingMe ? holeC.x : x,
                   y: launchingMe ? holeC.y + 8 : y)

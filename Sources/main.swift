@@ -170,6 +170,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { NSApp.terminate(nil) }
         }
+        if CommandLine.arguments.contains("--teartest") {
+            enabled = false
+            state.mode = 2
+            expand()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self = self, let p = self.panel else { return }
+                let pt = NSPoint(x: (p.frame.width - 470) / 2 + 235, y: p.frame.height - 150)
+                let ts = ProcessInfo.processInfo.systemUptime
+                if let dn = NSEvent.mouseEvent(with: .leftMouseDown, location: pt, modifierFlags: [],
+                                               timestamp: ts, windowNumber: p.windowNumber, context: nil,
+                                               eventNumber: 0, clickCount: 1, pressure: 1) { p.sendEvent(dn) }
+                if let up = NSEvent.mouseEvent(with: .leftMouseUp, location: pt, modifierFlags: [],
+                                               timestamp: ts + 0.05, windowNumber: p.windowNumber, context: nil,
+                                               eventNumber: 0, clickCount: 1, pressure: 1) { p.sendEvent(up) }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { NSApp.terminate(nil) }
+        }
         if let di = CommandLine.arguments.firstIndex(of: "--demo"), di + 1 < CommandLine.arguments.count {
             let m = Int(CommandLine.arguments[di + 1]) ?? 2
             dryLaunch = true
@@ -336,6 +353,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         run("超长拖动(两格)", Array(repeating: 12, count: 22), [], expect: -2)
         state.mode = 1
         run("霓虹模式轻扫", [8, 14, 20, 18, 10], [22, 14, 6], expect: -1)
+        // hit-region logic: clicks pass through everywhere except real content
+        geo = NotchGeometry.find()
+        if let g = geo {
+            state.notchWidth = g.notchRect.width
+            state.notchHeight = g.notchRect.height
+            let top = g.windowRect.maxY
+            let cx = g.windowRect.midX
+            func chk(_ name: String, _ p: NSPoint, _ expect: Bool) {
+                let ok = clickableRegionContains(p) == expect
+                results.append("\(ok ? "PASS" : "FAIL") 命中区·\(name)")
+            }
+            state.mode = 2
+            let spacing = max(70, (state.notchWidth - 60) / 2)
+            chk("菜单栏穿透", NSPoint(x: cx + 200, y: top - 10), false)
+            chk("票带可点", NSPoint(x: cx, y: top - 150), true)
+            chk("侧票带可点", NSPoint(x: cx + spacing, y: top - 150), true)
+            chk("票缝穿透", NSPoint(x: cx + spacing / 2, y: top - 150), spacing / 2 <= 37)
+            chk("岛下方穿透", NSPoint(x: cx, y: top - 330), false)
+            state.mode = 0
+            chk("星轨主体可点", NSPoint(x: cx, y: top - 120), true)
+            chk("星轨侧翼穿透", NSPoint(x: cx + 340, y: top - 120), false)
+        }
         for r in results { print(r) }
         print(results.allSatisfy { $0.hasPrefix("PASS") } ? "SELFTEST ALL PASS" : "SELFTEST HAS FAILURES")
         exit(0)
@@ -378,9 +417,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if g.notchRect.insetBy(dx: -8, dy: 0).contains(m) { expand() }
         case .expanded:
             let island = islandRectGlobal()
-            let inside = island.insetBy(dx: -28, dy: -28).contains(m)
-                || g.notchRect.insetBy(dx: -8, dy: 0).contains(m)
+            let nearNotch = g.notchRect.insetBy(dx: -8, dy: 0).contains(m)
+            let inside = island.insetBy(dx: -28, dy: -28).contains(m) || nearNotch
             if !inside && !pinned { collapse() }
+            else { panel?.ignoresMouseEvents = !clickableRegionContains(m) }
         case .launching:
             break
         }
@@ -391,6 +431,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let w = g.windowRect
         let s = state.openSize()
         return NSRect(x: w.midX - s.width / 2, y: w.maxY - s.height, width: s.width, height: s.height)
+    }
+
+    // The only places allowed to swallow a click. Everything else — the menu-bar strip,
+    // the gaps between tickets, the flanks, below the island — passes through to whatever is beneath.
+    func clickableRegionContains(_ m: NSPoint) -> Bool {
+        guard let g = geo else { return false }
+        let island = islandRectGlobal()
+        // the top strip (menu bar / notch height) never takes clicks
+        if m.y > g.windowRect.maxY - state.notchHeight - 2 { return false }
+        if state.mode == 2 {
+            // ticket mode: only the three paper strips are clickable
+            let spacing = max(70, (state.notchWidth - 60) / 2)
+            let yTop = g.windowRect.maxY - (state.notchHeight - 4)
+            guard m.y <= yTop && m.y >= yTop - 244 else { return false }
+            for i in 0..<3 where abs(m.x - (island.midX + CGFloat(i - 1) * spacing)) <= 37 { return true }
+            return false
+        }
+        // orbit / neon: the island body is the scroll + click surface
+        return island.insetBy(dx: -4, dy: 0).contains(m)
     }
 
     func expand() {
@@ -422,6 +481,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard state.phase == .expanded else { return }
         NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .default)
         Launcher.launch(t)   // fire immediately — the app switches while the animation plays on top
+        panel?.ignoresMouseEvents = true   // drop the click wall the moment the app switches
         withAnimation(.easeIn(duration: 0.30)) { state.phase = .launching }
         let linger = state.mode == 2 ? 0.72 : 0.46   // ticket mode: let the torn stub fall clear
         DispatchQueue.main.asyncAfter(deadline: .now() + linger) { [weak self] in
