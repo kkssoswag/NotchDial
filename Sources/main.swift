@@ -64,6 +64,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let pinned = CommandLine.arguments.contains("--pin")
     var lastRunCheck = Date.distantPast
     var modeItems: [NSMenuItem] = []
+    var axItem: NSMenuItem?
     // gesture state
     var gestureAcc: CGFloat = 0
     var stepsInGesture = 0
@@ -129,6 +130,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if CommandLine.arguments.contains("--selftest") { runSelfTest(); return }
         if CommandLine.arguments.contains("--cpuprobe") { runCpuProbe(); return }
+        if CommandLine.arguments.contains("--axprobe") { runAxProbe(dump: false); return }
+        if CommandLine.arguments.contains("--axdump") { runAxProbe(dump: true); return }
         rebuildPanel()
         setupStatusItem()
         statusMon.onChange = { [weak self] st in self?.state.work = st }
@@ -504,6 +507,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for _ in 0..<8 { htick(0) }
         htick(5000)
         results.append(hb.states[2] == .working ? "PASS 状态·大提交→即亮" : "FAIL 状态·大提交→即亮")
+        // AX label logic — the whole busy decision, checked without touching any app
+        let axCases: [(String, Bool)] = [
+            ("Running 可用工具检查", true), ("running notchdial build", true),
+            ("Stop response", true), ("停止生成", true), ("Interrupt", true),
+            ("Mark as unread Running shoes", false), ("Stop sharing", false),
+            ("New", false), ("Projects", false), ("此按钮也可以执行缩放窗口的操作", false),
+        ]
+        let axBad = axCases.filter { AXStatus.labelIsBusy($0.0) != $0.1 }.map { $0.0 }
+        results.append(axBad.isEmpty ? "PASS 状态·AX标签判定" : "FAIL 状态·AX标签判定 \(axBad)")
+        // an AX tree that only yields window chrome must not be trusted
+        let axm = StatusMonitor()
+        axm.dirPath = NSTemporaryDirectory() + "nd-ax-selftest-\(ProcessInfo.processInfo.processIdentifier)"
+        axm.frontmostBundlePath = { nil }
+        axm.axEnabled = false
+        var aNow = Date(timeIntervalSince1970: 3_000_000)
+        func atick(_ busy: Bool, nodes: Int, step: TimeInterval = 2) {
+            aNow = aNow.addingTimeInterval(step)
+            axm.applyAX([0: (busy, nodes)], now: aNow)
+        }
+        atick(true, nodes: 4)
+        results.append(axm.states[0] == nil ? "PASS 状态·空AX树不采信" : "FAIL 状态·空AX树不采信")
+        atick(true, nodes: 90)
+        results.append(axm.states[0] == .working ? "PASS 状态·AX→立刻工作中" : "FAIL 状态·AX→立刻工作中")
+        for _ in 0..<5 { atick(true, nodes: 90) }
+        atick(false, nodes: 90)
+        results.append(axm.states[0] == .done ? "PASS 状态·AX收工→出章" : "FAIL 状态·AX收工→出章")
+        atick(true, nodes: 90); atick(false, nodes: 90, step: 1)
+        results.append(axm.states[0] == nil ? "PASS 状态·AX短任务不出章" : "FAIL 状态·AX短任务不出章")
+        try? FileManager.default.removeItem(atPath: axm.dirPath)
         // stacked deck: each extra agent costs only the overlap step, never a full slot
         let e0 = IslandRoot.statusExtension(count: 0)
         let e1 = IslandRoot.statusExtension(count: 1)
@@ -527,6 +559,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for r in results { print(r) }
         print(results.allSatisfy { $0.hasPrefix("PASS") } ? "SELFTEST ALL PASS" : "SELFTEST HAS FAILURES")
         exit(0)
+    }
+
+    // Verifies the one signal that cannot be wrong: the app's own stop control.
+    // --axprobe polls each target for 20 s; --axdump lists every button label once
+    // so busyWords can be tuned per app.
+    func runAxProbe(dump: Bool) {
+        let ok = AXStatus.trusted(prompt: true)
+        print("AX TRUSTED: \(ok)")
+        if !ok {
+            print("→ 打开 系统设置 › 隐私与安全性 › 辅助功能，把 NotchDial 打开，然后重跑本命令")
+        }
+        // Electron keeps its web AX tree off until an assistive client opts in
+        for t in kTargets {
+            if let pid = AXStatus.pid(for: t) {
+                _ = AXStatus.enableWebTree(pid: pid, force: true)
+                print("AX \(t.name): pid \(pid) — 已请求网页 AX 树")
+            } else {
+                print("AX \(t.name): 未运行")
+            }
+        }
+        let settle = 2.5
+        print("等待 \(settle)s 让 Chromium 建树…")
+        DispatchQueue.main.asyncAfter(deadline: .now() + settle) {
+            for t in kTargets {
+                guard let pid = AXStatus.pid(for: t) else { continue }
+                if dump {
+                    let labels = AXStatus.dumpLabels(pid: pid)
+                    print("AX DUMP \(t.name) — \(labels.count) 个可点元素:")
+                    for l in labels.prefix(45) { print("   \(l)") }
+                } else {
+                    let p = AXStatus.probe(pid: pid)
+                    print("AX \(t.name): busy=\(p.busy) nodes=\(p.nodes) \(p.ms)ms hit=\(p.hit)")
+                }
+            }
+            if dump { exit(0) }
+        }
+        guard !dump else { RunLoop.main.run(); return }
+        var n = 0
+        let tm = Timer(timeInterval: 2.0, repeats: true) { tm in
+            n += 1
+            var line = "t+\(n * 2)s "
+            for t in kTargets {
+                guard let pid = AXStatus.pid(for: t) else { continue }
+                let p = AXStatus.probe(pid: pid)
+                line += "| \(t.name): \(p.busy ? "BUSY" : "idle ") \(p.nodes)n/\(p.ms)ms "
+            }
+            print(line)
+            if n >= 12 { tm.invalidate(); exit(0) }
+        }
+        tm.fireDate = Date().addingTimeInterval(settle)
+        RunLoop.main.add(tm, forMode: .common)
     }
 
     // measures real per-target utilization over 4 s — settles the rusage unit question empirically
@@ -744,6 +827,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         st.target = self
         st.state = UserDefaults.standard.bool(forKey: "statusEnabled") ? .on : .off
         menu.addItem(st)
+        let ax = NSMenuItem(title: "精确状态：辅助功能权限", action: #selector(fixAX(_:)), keyEquivalent: "")
+        ax.target = self
+        menu.addItem(ax)
+        axItem = ax
+        refreshAxItem()
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "退出 NotchDial", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp
@@ -756,6 +844,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // the island must never sit under (or fight with) an open menu
     func menuWillOpen(_ menu: NSMenu) {
         if !pinned { collapse() }
+        refreshAxItem()
+    }
+
+    func refreshAxItem() {
+        guard let ax = axItem else { return }
+        let ok = AXStatus.trusted()
+        ax.state = ok ? .on : .off
+        ax.title = ok ? "精确状态：已授权 ✓" : "精确状态：点此授权辅助功能"
+    }
+
+    // Without this grant we can only guess; with it we read the app's own UI.
+    @objc func fixAX(_ item: NSMenuItem) {
+        if AXStatus.trusted() { refreshAxItem(); return }
+        _ = AXStatus.trusted(prompt: true)
+        if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(u)
+        }
     }
 
     func refreshModeChecks() {

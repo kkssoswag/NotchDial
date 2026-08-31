@@ -22,11 +22,37 @@ Kick off a long agent run, switch away, and glance at the notch: while an agent 
 
 The widened bar is itself a hover target, split by where you enter: glide in over the **notch** and you get the switcher, as always; glide in over the **widened part beside it** and the bar itself grows downward into a small status ledger — one continuous silhouette whose top corners flare out in concave curves, like it's growing out of the screen edge. One receipt row per agent (icon · name · spinner or rubber stamp), separated by ticket perforation. **Click a row to jump straight to that app**; the top strip still passes every click through to the menu bar, and the ledger retracts the moment you leave.
 
-Three signals, merged per app:
+### Where the status comes from
 
-1. **Storage heartbeat (instant, zero-config — Claude desktop).** Cloud-side agents barely touch local CPU, but the desktop app commits the streaming conversation into claude.ai's local IndexedDB as tokens arrive — starting within about a second of you hitting send. NotchDial watches that directory's byte growth: sustained commits → *working* (lights up ~2 s after send), commits stop → *done* (~5 s after the last token). No hooks, no setup, and it tracks the real session — not your typing or scrolling.
+Guessing does not work, and it is worth being blunt about why. Agents increasingly
+run in the cloud while the desktop app is just a viewer, so every local proxy is
+measuring the wrong thing. Measured on a real session, with the agent's own turn
+boundaries as ground truth:
 
-2. **File protocol (precise — agents report themselves).** One word into one file:
+| signal | agent streaming | agent idle |
+| --- | --- | --- |
+| local storage writes | 26 B/s | **583 B/s** |
+| network in | 484 B/s | 193 B/s |
+| app CPU | 9.7% | 21.1% |
+
+The idle column is *higher*. Any threshold you pick on those numbers is a coin flip.
+So NotchDial reads the truth instead, in this order:
+
+1. **The app's own UI, via the Accessibility API (authoritative).** While a session
+   is live, Claude's sidebar labels it `Running <name>`; Cursor and Codex show a
+   stop/interrupt control. That label is the same thing you see on screen, per
+   session, and it is correct for cloud and local runs alike. One catch: Chromium
+   keeps its web accessibility tree switched off until an assistive client opts in,
+   so NotchDial writes `AXManualAccessibility` on the app first — after that a scan
+   finds the state in ~10–30 ms over ~100 nodes, off the main thread, and exits early
+   on the first hit.
+
+   Needs a one-time grant: **menu bar → 精确状态**, or System Settings › Privacy &
+   Security › Accessibility › NotchDial. Nothing else to configure, ever. (Ad-hoc
+   signed builds change identity on every rebuild, so macOS may ask again after you
+   rebuild from source.)
+
+2. **File protocol (explicit — agents report themselves).** One word into one file:
 
    ```bash
    mkdir -p ~/.notchdial/status
@@ -47,9 +73,16 @@ Three signals, merged per app:
 
    Codex / Cursor / anything else: any hook, wrapper script, or the agent itself running that one `echo` works the same way.
 
-3. **CPU fallback (automatic).** Sustained CPU (several seconds above threshold) from a **background** app's process tree — a local build, an export, indexing — flips it to *working* with zero setup, via pure `libproc` syscalls (nothing spawned, no permissions). The frontmost app never auto-triggers: using an app is not the same as the app working, so typing and scrolling can't produce phantom states — only file-reported states show for the app you're in. Note: cloud-side agents streaming into a background window barely touch local CPU — that's exactly what the file protocol is for.
+3. **Local-work fallback (only where 1 and 2 are silent).** Sustained CPU from a
+   **background** app's process tree — a local build, an export, indexing — reads as
+   *working*, via pure `libproc` syscalls (nothing spawned, no permissions). The
+   frontmost app never auto-triggers, because using an app is not the same as the app
+   working. This is a guess, and it is switched off per app the moment the
+   Accessibility signal can read that app for real.
 
 Toggle: menu bar → 工作状态指示, or `defaults write com.dd.notchdial statusEnabled -bool false`.
+Troubleshooting: `defaults write com.dd.notchdial statusDebug -bool true` logs every
+signal and state change to `/tmp/nd-status.log`.
 
 ## ⚡ One-prompt setup with your AI agent
 
@@ -99,8 +132,8 @@ open /Applications/NotchDial.app
 - Hover the notch to expand; move away to collapse.
 - Orbit / Neon: one swipe = one step (momentum is ignored by design); click the centered item to activate the app, Dock-style.
 - Tickets: just click a ticket.
-- Agent status: spinner beside the notch while an agent works, green ✓ when it finishes — cleared by switching to that app.
-- Menu bar capsule icon: switch modes (⌘1/⌘2/⌘3), pause hover trigger, toggle status indicators, launch at login, quit.
+- Agent status: spinner beside the notch while an agent works, rubber stamp when it finishes — cleared by switching to that app; hover the widened bar for the per-agent ledger and click a row to jump.
+- Menu bar capsule icon: switch modes (⌘1/⌘2/⌘3), pause hover trigger, toggle status indicators, grant the Accessibility permission that makes status exact, launch at login, quit.
 
 ## Configure your apps
 
@@ -108,7 +141,7 @@ Targets live in `Sources/Targets.swift` (name / bundle path / brand tint / plane
 
 ## Debug flags
 
-`--pin` keep expanded · `--snap out.png` offscreen snapshot · `--film dir/` frame-by-frame capture · `--selftest` gesture engine + hit-region + status state-machine tests · `--clicktest` synthesized-click hit-testing test · `--launchtest` measures click→app-activation latency · `--teartest` real tear-launch-retract cycle · `--demo <0|1|2>` scripted showcase run (for screen-recording demos) · `--statustest` scripted status choreography through the real file pipeline · `--cpuprobe` prints each target's measured CPU utilization over 4 s
+`--pin` keep expanded · `--snap out.png` offscreen snapshot · `--film dir/` frame-by-frame capture · `--selftest` gesture engine + hit-region + status state-machine tests · `--clicktest` synthesized-click hit-testing test · `--launchtest` measures click→app-activation latency · `--teartest` real tear-launch-retract cycle · `--demo <0|1|2>` scripted showcase run (for screen-recording demos) · `--statustest` scripted status choreography through the real file pipeline · `--cpuprobe` prints each target's measured CPU utilization over 4 s · `--axprobe` polls the Accessibility signal for 24 s (busy / nodes / ms per app) · `--axdump` lists every button label an app exposes, for tuning `AXStatus.busyPrefixes`
 
 ## License
 

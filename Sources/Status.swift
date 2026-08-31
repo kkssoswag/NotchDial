@@ -50,6 +50,18 @@ final class StatusMonitor {
     private var hbActive: Set<Int> = []
     private var hbStart: [Int: Date] = [:]
 
+    // MARK: accessibility signal (authoritative)
+    // The app's own UI is the only source that cannot be wrong: Claude's sidebar
+    // labels a live session "Running <name>", Cursor/Codex show a stop control.
+    // Where AX gives us a real tree we trust it exclusively and ignore the
+    // guessing signals below, which measurably lie for cloud-run sessions.
+    var axEnabled = true
+    private let axQueue = DispatchQueue(label: "com.dd.notchdial.ax", qos: .utility)
+    private var axInFlight = false
+    private var axBusy: Set<Int> = []          // agents the UI says are working
+    private var axUsable: Set<Int> = []        // apps whose AX tree we can actually read
+    private var axStart: [Int: Date] = [:]
+
     private(set) var states: [Int: WorkState] = [:]   // only non-idle entries
     private var timer: Timer?
     private var prevCPU: [Int: Double] = [:]
@@ -65,6 +77,20 @@ final class StatusMonitor {
         t.name.lowercased().replacingOccurrences(of: " ", with: "-")
     }
 
+    // `defaults write com.dd.notchdial statusDebug -bool true` → /tmp/nd-status.log
+    static let debug = UserDefaults.standard.bool(forKey: "statusDebug")
+    private func log(_ s: String) {
+        guard Self.debug else { return }
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        guard let d = "\(stamp) \(s)\n".data(using: .utf8) else { return }
+        let p = "/tmp/nd-status.log"
+        if let fh = FileHandle(forWritingAtPath: p) {
+            fh.seekToEndOfFile(); fh.write(d); try? fh.close()
+        } else {
+            try? d.write(to: URL(fileURLWithPath: p))
+        }
+    }
+
     func start() {
         guard timer == nil else { return }
         let d = UserDefaults.standard
@@ -77,6 +103,13 @@ final class StatusMonitor {
         let tm = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(tm, forMode: .common)
         timer = tm
+        log("START axEnabled=\(axEnabled) trusted=\(AXStatus.trusted()) hbDirs=\(hbDir.count) pids=\(kTargets.compactMap { AXStatus.pid(for: $0) })")
+        // Exact status needs one Accessibility grant. Ask once, ever; the menu item
+        // stays available for later. Without it we quietly fall back to guessing.
+        if axEnabled, !AXStatus.trusted(), !UserDefaults.standard.bool(forKey: "axPromptShown") {
+            UserDefaults.standard.set(true, forKey: "axPromptShown")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { _ = AXStatus.trusted(prompt: true) }
+        }
         // switching to a finished app acknowledges its ✓
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] n in
@@ -98,6 +131,7 @@ final class StatusMonitor {
         states = [:]; autoWorking = []; autoDone = []
         hot = [:]; cold = [:]; prevCPU = [:]; prevTime = nil; doneFrontTicks = [:]
         hbPrevSize = [:]; hbLastEvent = [:]; hbPrevEvent = [:]; hbActive = []; hbStart = [:]
+        axBusy = []; axUsable = []; axStart = [:]
         onChange?(states)
     }
 
@@ -165,9 +199,59 @@ final class StatusMonitor {
         return s
     }
 
+    /// One AX sweep, off the main thread so a wedged app can never stall the island.
+    private func pollAX() {
+        guard axEnabled, !axInFlight, AXStatus.trusted() else { return }
+        var pids: [(Int, pid_t)] = []
+        for t in kTargets { if let p = AXStatus.pid(for: t) { pids.append((t.id, p)) } }
+        guard !pids.isEmpty else { return }
+        axInFlight = true
+        axQueue.async { [weak self] in
+            var out: [Int: (Bool, Int)] = [:]
+            for (id, pid) in pids {
+                if AXStatus.enableWebTree(pid: pid) {
+                    AXStatus.setTimeout(pid: pid, 0.4)
+                    continue   // Chromium needs a beat to build the tree; read it next sweep
+                }
+                let p = AXStatus.probe(pid: pid)
+                out[id] = (p.busy, p.nodes)
+            }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.applyAX(out, now: Date())
+                self.axInFlight = false
+            }
+        }
+    }
+
+    /// A tree with only the window's own chrome in it (a handful of nodes) means the
+    /// app never opted in — that app keeps using the fallback signals.
+    func applyAX(_ res: [Int: (Bool, Int)], now: Date) {
+        for (id, r) in res {
+            let (busy, nodes) = r
+            if nodes >= 20 { axUsable.insert(id) } else { axUsable.remove(id) }
+            guard axUsable.contains(id) else { continue }
+            if busy {
+                if !axBusy.contains(id) {
+                    axBusy.insert(id)
+                    axStart[id] = now
+                    autoDone.remove(id)
+                }
+            } else if axBusy.contains(id) {
+                axBusy.remove(id)
+                if now.timeIntervalSince(axStart[id] ?? now) >= minWorkForDone {
+                    autoDone.insert(id)
+                }
+            }
+        }
+        if !res.isEmpty { log("AX res=\(res.map { "\($0.key):\($0.value.0 ? "BUSY" : "idle")/\($0.value.1)n" }.sorted()) usable=\(axUsable.sorted()) busy=\(axBusy.sorted())") }
+        publish()
+    }
+
     // one sampling step; cpuSample/now injectable for the self-test
     func tick(cpuSample: [Int: Double]? = nil, now: Date = Date()) {
-        for (id, dir) in hbDir { hbSample(id, size: hbTotalSize(dir), now: now) }
+        pollAX()
+        for (id, dir) in hbDir where !axUsable.contains(id) { hbSample(id, size: hbTotalSize(dir), now: now) }
         let cpu = cpuSample ?? Self.cpuSecondsByTarget()
         let front = frontmostBundlePath()
         if let pt = prevTime, now > pt {
@@ -178,7 +262,10 @@ final class StatusMonitor {
                 // The frontmost app is being *used*, which is not the same as *working*:
                 // typing, scrolling and rendering all burn CPU. Auto detection therefore
                 // only ever applies to background apps; file-reported states always win.
-                if front == t.path {
+                if axUsable.contains(t.id) {
+                    hot[t.id] = 0                 // AX knows the truth for this app
+                    autoWorking.remove(t.id)
+                } else if front == t.path {
                     hot[t.id] = 0
                     autoWorking.remove(t.id)
                 } else if util >= cpuOn { hot[t.id, default: 0] += 1; cold[t.id] = 0 }
@@ -207,10 +294,15 @@ final class StatusMonitor {
         let front = frontmostBundlePath()
         for t in kTargets {
             let fs = fileState(t)
+            // where AX can read the app's UI it is the only signal that counts
+            let guessWorking = axUsable.contains(t.id)
+                ? false
+                : (autoWorking.contains(t.id) || hbActive.contains(t.id))
+            let live = axBusy.contains(t.id) || guessWorking
             var s: WorkState = .idle
-            if fs == .working || autoWorking.contains(t.id) || hbActive.contains(t.id) { s = .working }
+            if fs == .working || live { s = .working }
             else if fs == .done || autoDone.contains(t.id) { s = .done }
-            if fs == .idle && !autoWorking.contains(t.id) && !hbActive.contains(t.id) { s = .idle; autoDone.remove(t.id) }
+            if fs == .idle && !live { s = .idle; autoDone.remove(t.id) }
             // ✓ while you are already looking at that app → acknowledge after ~3 s
             if s == .done, front == t.path {
                 doneFrontTicks[t.id, default: 0] += 1
@@ -225,6 +317,7 @@ final class StatusMonitor {
             if s != .idle { out[t.id] = s }
         }
         if out != states {
+            log("PUBLISH \(out.map { "\($0.key)=\($0.value)" }.sorted())")
             states = out
             onChange?(states)
         }
