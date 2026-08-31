@@ -133,6 +133,14 @@ struct OrbitView: View {
                     .blur(radius: 1.5)
             }
             .frame(width: size, height: size)
+            .overlay(alignment: .topTrailing) {
+                if let ws = state.work[tg.id], morph > 0.55, !sess, alpha > 0 {
+                    StatusBadge(ws: ws, tint: tg.tint, size: 9)
+                        .padding(3.5)
+                        .background(Circle().fill(Color.black.opacity(0.5)))
+                        .offset(x: 7, y: -5)
+                }
+            }
             .scaleEffect(hoverID == tg.id && isCenter && !launchingMe ? 1.07 : 1)
             .animation(.easeOut(duration: 0.15), value: hoverID)
             Text(tg.name)

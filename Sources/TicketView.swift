@@ -212,6 +212,10 @@ struct TicketView: View {
                     Circle().fill(acc).frame(width: 4, height: 4)
                         .position(x: TW / 2, y: 160)
                 }
+                if let ws = state.work[i] {
+                    StatusBadge(ws: ws, tint: acc, paper: true, size: 9)
+                        .position(x: TW - 13, y: 15)
+                }
                 Line()
                     .stroke(Self.ink.opacity(0.4), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
                     .frame(width: TW - 12, height: 1)

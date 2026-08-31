@@ -35,6 +35,7 @@ final class IslandState: ObservableObject {
     @Published var notchWidth: CGFloat = 210
     @Published var notchHeight: CGFloat = 32
     @Published var runningIDs: Set<Int> = []
+    @Published var work: [Int: WorkState] = [:]   // agent status: only non-idle entries
 
     var centeredIndex: Int {
         let n = kTargets.count
@@ -53,6 +54,7 @@ final class IslandState: ObservableObject {
 // MARK: - App delegate
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let state = IslandState()
+    let statusMon = StatusMonitor()
     var panel: NSPanel?
     var geo: NotchGeometry?
     var statusItem: NSStatusItem?
@@ -85,6 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        UserDefaults.standard.register(defaults: ["statusEnabled": true])
         if UserDefaults.standard.object(forKey: "lastIndex") != nil {
             state.rotation = Double(UserDefaults.standard.integer(forKey: "lastIndex"))
         } else { state.rotation = 1 }
@@ -124,8 +127,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             exit(0)
         }
         if CommandLine.arguments.contains("--selftest") { runSelfTest(); return }
+        if CommandLine.arguments.contains("--cpuprobe") { runCpuProbe(); return }
         rebuildPanel()
         setupStatusItem()
+        statusMon.onChange = { [weak self] st in self?.state.work = st }
+        if UserDefaults.standard.bool(forKey: "statusEnabled") { statusMon.start() }
         NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved]) { [weak self] _ in self?.mouseMoved() }
         NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved]) { [weak self] e in self?.mouseMoved(); return e }
         let t = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in self?.mouseMoved() }
@@ -224,6 +230,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 synthClick(235, 120, after: 5.1)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 6.3) { [weak self] in self?.collapse() }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 7.2) { NSApp.terminate(nil) }
+            }
+        }
+        if CommandLine.arguments.contains("--statustest") {
+            // scripted status choreography through the real file-protocol pipeline
+            enabled = false
+            let dir = statusMon.dirPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            func put(_ slug: String, _ v: String, after t: Double) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + t) {
+                    try? v.write(toFile: (dir as NSString).appendingPathComponent(slug), atomically: true, encoding: .utf8)
+                }
+            }
+            put("claude-code", "working", after: 0.6)   // one spinner
+            put("cursor", "working", after: 3.4)        // two spinners
+            put("claude-code", "done", after: 6.2)      // ✓ pops beside the spinner
+            DispatchQueue.main.asyncAfter(deadline: .now() + 9.2) { [weak self] in self?.expand() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12.4) { [weak self] in self?.collapse() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 13.6) {
+                for s in ["claude-code", "cursor", "codex"] {
+                    try? FileManager.default.removeItem(atPath: (dir as NSString).appendingPathComponent(s))
+                }
+                NSApp.terminate(nil)
             }
         }
         if let fi = CommandLine.arguments.firstIndex(of: "--film"), fi + 1 < CommandLine.arguments.count {
@@ -375,9 +403,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             chk("星轨主体可点", NSPoint(x: cx, y: top - 120), true)
             chk("星轨侧翼穿透", NSPoint(x: cx + 340, y: top - 120), false)
         }
+        // work-status state machine: synthetic CPU samples + a temp status dir, no timers
+        let mon = StatusMonitor()
+        mon.dirPath = NSTemporaryDirectory() + "nd-status-selftest-\(ProcessInfo.processInfo.processIdentifier)"
+        try? FileManager.default.createDirectory(atPath: mon.dirPath, withIntermediateDirectories: true)
+        mon.frontmostBundlePath = { nil }
+        var mNow = Date(timeIntervalSince1970: 1_000_000)
+        var mCum = 0.0
+        func mtick(_ util: Double) {
+            mCum += util * 1.5
+            mNow = mNow.addingTimeInterval(1.5)
+            mon.tick(cpuSample: [0: mCum], now: mNow)
+        }
+        mtick(0)
+        for _ in 0..<3 { mtick(0) }
+        results.append(mon.states[0] == nil ? "PASS 状态·初始空闲" : "FAIL 状态·初始空闲")
+        for _ in 0..<3 { mtick(0.9) }
+        results.append(mon.states[0] == nil ? "PASS 状态·短脉冲不触发" : "FAIL 状态·短脉冲不触发")
+        mtick(0.9)
+        results.append(mon.states[0] == .working ? "PASS 状态·持续高载→工作中" : "FAIL 状态·持续高载→工作中")
+        for _ in 0..<6 { mtick(0.9) }
+        for _ in 0..<4 { mtick(0) }
+        results.append(mon.states[0] == .done ? "PASS 状态·收工→对勾" : "FAIL 状态·收工→对勾")
+        mon.frontmostBundlePath = { kTargets[0].path }
+        mtick(0); mtick(0)
+        results.append(mon.states[0] == nil ? "PASS 状态·看过后清除" : "FAIL 状态·看过后清除")
+        mon.frontmostBundlePath = { nil }
+        let fp = (mon.dirPath as NSString).appendingPathComponent("claude-code")
+        try? "working".write(toFile: fp, atomically: true, encoding: .utf8)
+        mtick(0)
+        results.append(mon.states[2] == .working ? "PASS 状态·文件working" : "FAIL 状态·文件working")
+        try? "done".write(toFile: fp, atomically: true, encoding: .utf8)
+        mtick(0)
+        results.append(mon.states[2] == .done ? "PASS 状态·文件done" : "FAIL 状态·文件done")
+        mon.frontmostBundlePath = { kTargets[2].path }
+        mtick(0); mtick(0)
+        let fileGone = !FileManager.default.fileExists(atPath: fp)
+        results.append(mon.states[2] == nil && fileGone ? "PASS 状态·确认后清理文件" : "FAIL 状态·确认后清理文件")
+        try? FileManager.default.removeItem(atPath: mon.dirPath)
+        let e0 = IslandRoot.statusExtension(count: 0)
+        let e1 = IslandRoot.statusExtension(count: 1)
+        let e3 = IslandRoot.statusExtension(count: 3)
+        results.append(e0 == 0 && e1 > 20 && e3 > e1 ? "PASS 状态·胶囊宽度" : "FAIL 状态·胶囊宽度")
         for r in results { print(r) }
         print(results.allSatisfy { $0.hasPrefix("PASS") } ? "SELFTEST ALL PASS" : "SELFTEST HAS FAILURES")
         exit(0)
+    }
+
+    // measures real per-target utilization over 4 s — settles the rusage unit question empirically
+    func runCpuProbe() {
+        let a = StatusMonitor.cpuSecondsByTarget()
+        let t0 = Date()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            let b = StatusMonitor.cpuSecondsByTarget()
+            let dt = Date().timeIntervalSince(t0)
+            for t in kTargets {
+                let u = max(0, (b[t.id] ?? 0) - (a[t.id] ?? 0)) / dt
+                print("CPUPROBE \(t.name): \(String(format: "%.4f", u))")
+            }
+            exit(0)
+        }
     }
 
     func rebuildPanel() {
@@ -519,6 +604,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let toggle = NSMenuItem(title: "暂停悬停触发", action: #selector(toggleEnabled(_:)), keyEquivalent: "")
         toggle.target = self
         menu.addItem(toggle)
+        let st = NSMenuItem(title: "工作状态指示", action: #selector(toggleStatus(_:)), keyEquivalent: "")
+        st.target = self
+        st.state = UserDefaults.standard.bool(forKey: "statusEnabled") ? .on : .off
+        menu.addItem(st)
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "退出 NotchDial", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp
@@ -562,6 +651,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         enabled.toggle()
         item.title = enabled ? "暂停悬停触发" : "恢复悬停触发"
         if !enabled { collapse() }
+    }
+
+    @objc func toggleStatus(_ item: NSMenuItem) {
+        let on = !UserDefaults.standard.bool(forKey: "statusEnabled")
+        UserDefaults.standard.set(on, forKey: "statusEnabled")
+        item.state = on ? .on : .off
+        if on { statusMon.start() } else { statusMon.stop() }
     }
 }
 

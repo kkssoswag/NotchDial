@@ -2,7 +2,7 @@
 
 Turn your MacBook notch into a playful switcher for your AI coding agents.
 
-Hover the notch, and switch between **Codex / Cursor / Claude** in one of three hand-crafted modes — a pocket universe, a neon sign, or a strip of tear-off tickets. Click, and the app is frontmost in ~12 ms.
+Hover the notch, and switch between **Codex / Cursor / Claude** in one of three hand-crafted modes — a pocket universe, a neon sign, or a strip of tear-off tickets. Click, and the app is frontmost in ~12 ms. While an agent is working, its icon and a spinning ring live beside the notch — and a green ✓ lands there the moment it finishes.
 
 https://github.com/user-attachments/assets/39c76579-0f78-4b29-822e-a5045ef01156
 
@@ -15,6 +15,37 @@ https://github.com/user-attachments/assets/39c76579-0f78-4b29-822e-a5045ef01156
 - **Orbit · Black Hole** — a transparent deep-space scene composited straight onto your desktop: lensed starfield, twin nebulae, faint planet silhouettes, an accretion disk in the selected app's brand color. Swipe once and the next app flies in from deep space as a textured planet, bursts apart mid-flight and reassembles as its icon.
 - **Neon Sign** — the current agent as a hand-bent neon sign: power-down flicker, letter-by-letter ignition, electric surge on launch.
 - **Tear Tickets** — three paper tickets feed out of the notch and sway on real pendulum physics (roots pinned in the slot). Click one to tear its stub along the perforation — commit after tear.
+
+## 🟢 Live agent status in the notch
+
+Kick off a long agent run, switch away, and glance at the notch: while an agent works, the black bar quietly widens — its app icon on the left, a spinner in the app's color on the right. When the task finishes, the spinner pops into a **green ✓ that stays until you actually switch to that app** (or it auto-clears a few seconds after you're already there). Expanded, each mode speaks its own dialect: a rubber-stamped ✓ on the paper ticket, a badge on the orbit icon, a neon tick under the sign.
+
+Two signals, merged per app:
+
+1. **File protocol (precise — agents report themselves).** One word into one file:
+
+   ```bash
+   mkdir -p ~/.notchdial/status
+   echo working > ~/.notchdial/status/claude-code   # spinner on
+   echo done    > ~/.notchdial/status/claude-code   # ✓ until acknowledged
+   ```
+
+   The file name is the target's slug: its `name` in `Targets.swift`, lowercased, spaces → `-` (`codex`, `cursor`, `claude-code`). `working` files older than 30 min are ignored (crashed agent); NotchDial deletes the file once the ✓ is acknowledged.
+
+   Claude Code wiring (`~/.claude/settings.json` hooks):
+
+   ```json
+   {"hooks": {
+     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "mkdir -p ~/.notchdial/status; echo working > ~/.notchdial/status/claude-code"}]}],
+     "Stop":             [{"hooks": [{"type": "command", "command": "echo done > ~/.notchdial/status/claude-code"}]}]
+   }}
+   ```
+
+   Codex / Cursor / anything else: any hook, wrapper script, or the agent itself running that one `echo` works the same way.
+
+2. **CPU fallback (automatic).** Sustained CPU from an app's process tree — a local build, an export, indexing — flips it to *working* with zero setup, via pure `libproc` syscalls (nothing spawned, no permissions). Sustained-threshold hysteresis filters out typing and scrolling bursts. Note: cloud-side agents streaming into a background window barely touch local CPU — that's exactly what the file protocol is for.
+
+Toggle: menu bar → 工作状态指示, or `defaults write com.dd.notchdial statusEnabled -bool false`.
 
 ## ⚡ One-prompt setup with your AI agent
 
@@ -33,7 +64,7 @@ You are configuring NotchDial for this user's three apps. Environment: a notched
 1. `git clone https://github.com/kkssoswag/NotchDial.git && cd NotchDial`
 2. Resolve each app's real bundle path and confirm it exists (`/Applications`, `~/Applications`, `/System/Applications`).
 3. Edit the three `AppTarget` entries in `Sources/Targets.swift` — keep **exactly three**, `id` stays `0/1/2` (left-to-right order):
-   - `name`: short display name (≤ 8 characters renders best in Neon mode)
+   - `name`: short display name (≤ 8 characters renders best in Neon mode; it also defines the status-file slug — lowercased, spaces → `-`)
    - `path`: absolute path to the `.app` bundle
    - `tint`: the app's brand color
    - `planetHi` / `planetLo`: lighter / darker shades of that color (Orbit-mode planet sprite)
@@ -64,7 +95,8 @@ open /Applications/NotchDial.app
 - Hover the notch to expand; move away to collapse.
 - Orbit / Neon: one swipe = one step (momentum is ignored by design); click the centered item to activate the app, Dock-style.
 - Tickets: just click a ticket.
-- Menu bar capsule icon: switch modes (⌘1/⌘2/⌘3), pause hover trigger, launch at login, quit.
+- Agent status: spinner beside the notch while an agent works, green ✓ when it finishes — cleared by switching to that app.
+- Menu bar capsule icon: switch modes (⌘1/⌘2/⌘3), pause hover trigger, toggle status indicators, launch at login, quit.
 
 ## Configure your apps
 
@@ -72,7 +104,7 @@ Targets live in `Sources/Targets.swift` (name / bundle path / brand tint / plane
 
 ## Debug flags
 
-`--pin` keep expanded · `--snap out.png` offscreen snapshot · `--film dir/` frame-by-frame capture · `--selftest` gesture engine tests · `--clicktest` synthesized-click hit-testing test · `--launchtest` measures click→app-activation latency · `--teartest` real tear-launch-retract cycle · `--demo <0|1|2>` scripted showcase run (for screen-recording demos)
+`--pin` keep expanded · `--snap out.png` offscreen snapshot · `--film dir/` frame-by-frame capture · `--selftest` gesture engine + hit-region + status state-machine tests · `--clicktest` synthesized-click hit-testing test · `--launchtest` measures click→app-activation latency · `--teartest` real tear-launch-retract cycle · `--demo <0|1|2>` scripted showcase run (for screen-recording demos) · `--statustest` scripted status choreography through the real file pipeline · `--cpuprobe` prints each target's measured CPU utilization over 4 s
 
 ## License
 

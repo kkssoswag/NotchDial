@@ -32,10 +32,20 @@ struct NeonView: View {
             }
             HStack(spacing: 9) {
                 ForEach(kTargets) { t in
-                    Circle()
-                        .fill(t.id == state.centeredIndex ? t.tint : Color(white: 0.16))
-                        .frame(width: 6, height: 6)
-                        .shadow(color: t.id == state.centeredIndex ? t.tint : .clear, radius: 5)
+                    Group {
+                        switch state.work[t.id] ?? .idle {
+                        case .working:
+                            WorkSpinner(tint: t.tint, size: 8, lineWidth: 1.5)
+                        case .done:
+                            DoneCheck(size: 8)
+                        case .idle:
+                            Circle()
+                                .fill(t.id == state.centeredIndex ? t.tint : Color(white: 0.16))
+                                .frame(width: 6, height: 6)
+                                .shadow(color: t.id == state.centeredIndex ? t.tint : .clear, radius: 5)
+                        }
+                    }
+                    .frame(width: 10, height: 10)
                 }
             }
             .padding(.top, 2)
