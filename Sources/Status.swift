@@ -28,6 +28,28 @@ final class StatusMonitor {
     var frontmostBundlePath: () -> String? = { NSWorkspace.shared.frontmostApplication?.bundleURL?.path }
     var onChange: (([Int: WorkState]) -> Void)?
 
+    // MARK: live heartbeat (thin-client sync)
+    // Cloud-side agents barely touch local CPU — but their desktop apps commit the
+    // streaming conversation to local storage as tokens arrive. The Claude app writes
+    // claude.ai's IndexedDB (LevelDB) within ~a second of you hitting send, and keeps
+    // appending for as long as the agent is thinking/answering. Watching that
+    // directory's byte growth gives instant, truthful working/done — no hooks needed.
+    static let heartbeatDirs: [String: String] = [   // bundle-path suffix → storage dir
+        "/Claude.app": NSHomeDirectory() + "/Library/Application Support/Claude/IndexedDB/https_claude.ai_0.indexeddb.leveldb"
+    ]
+    // Real-world pattern (measured): commits arrive in intermittent batches, every
+    // 2–5 s while a session streams, up to ~6 KB each, dead silent when idle.
+    var hbGrowthOn: UInt64 = 256          // bytes of growth that count as one commit event
+    var hbEventGap: TimeInterval = 6      // two commits this close together = live session
+    var hbBigCommit: UInt64 = 4096        // a single commit this large latches instantly (the send itself)
+    var hbQuiet: TimeInterval = 12        // this long without commits = the session went quiet
+    private var hbDir: [Int: String] = [:]
+    private var hbPrevSize: [Int: UInt64] = [:]
+    private var hbLastEvent: [Int: Date] = [:]
+    private var hbPrevEvent: [Int: Date] = [:]
+    private var hbActive: Set<Int> = []
+    private var hbStart: [Int: Date] = [:]
+
     private(set) var states: [Int: WorkState] = [:]   // only non-idle entries
     private var timer: Timer?
     private var prevCPU: [Int: Double] = [:]
@@ -47,7 +69,12 @@ final class StatusMonitor {
         guard timer == nil else { return }
         let d = UserDefaults.standard
         if d.object(forKey: "statusCpuOn") != nil { cpuOn = d.double(forKey: "statusCpuOn") }
-        let tm = Timer(timeInterval: 1.5, repeats: true) { [weak self] _ in self?.tick() }
+        for t in kTargets {
+            for (suffix, dir) in Self.heartbeatDirs where t.path.hasSuffix(suffix) {
+                if FileManager.default.fileExists(atPath: dir) { hbDir[t.id] = dir }
+            }
+        }
+        let tm = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(tm, forMode: .common)
         timer = tm
         // switching to a finished app acknowledges its ✓
@@ -70,6 +97,7 @@ final class StatusMonitor {
         timer?.invalidate(); timer = nil
         states = [:]; autoWorking = []; autoDone = []
         hot = [:]; cold = [:]; prevCPU = [:]; prevTime = nil; doneFrontTicks = [:]
+        hbPrevSize = [:]; hbLastEvent = [:]; hbPrevEvent = [:]; hbActive = []; hbStart = [:]
         onChange?(states)
     }
 
@@ -102,8 +130,44 @@ final class StatusMonitor {
         return nil
     }
 
+    // one heartbeat measurement + state step; injectable for the self-test
+    func hbSample(_ id: Int, size: UInt64, now: Date) {
+        let prev = hbPrevSize[id] ?? size
+        hbPrevSize[id] = size
+        let delta = size > prev ? size - prev : 0
+        if delta >= hbGrowthOn {   // one storage commit
+            let previous = hbLastEvent[id]
+            hbPrevEvent[id] = previous
+            hbLastEvent[id] = now
+            let paired = previous.map { now.timeIntervalSince($0) <= hbEventGap } ?? false
+            if !hbActive.contains(id), paired || delta >= hbBigCommit {
+                hbActive.insert(id)
+                autoDone.remove(id)
+                hbStart[id] = previous ?? now
+            }
+        }
+        if hbActive.contains(id), let last = hbLastEvent[id], now.timeIntervalSince(last) >= hbQuiet {
+            hbActive.remove(id)
+            if now.timeIntervalSince(hbStart[id] ?? now) >= minWorkForDone {
+                autoDone.insert(id)
+            }
+        }
+    }
+
+    private func hbTotalSize(_ dir: String) -> UInt64 {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: dir) else { return 0 }
+        var s: UInt64 = 0
+        for n in names {
+            if let a = try? fm.attributesOfItem(atPath: (dir as NSString).appendingPathComponent(n)),
+               let sz = a[.size] as? UInt64 { s += sz }
+        }
+        return s
+    }
+
     // one sampling step; cpuSample/now injectable for the self-test
     func tick(cpuSample: [Int: Double]? = nil, now: Date = Date()) {
+        for (id, dir) in hbDir { hbSample(id, size: hbTotalSize(dir), now: now) }
         let cpu = cpuSample ?? Self.cpuSecondsByTarget()
         let front = frontmostBundlePath()
         if let pt = prevTime, now > pt {
@@ -144,9 +208,9 @@ final class StatusMonitor {
         for t in kTargets {
             let fs = fileState(t)
             var s: WorkState = .idle
-            if fs == .working || autoWorking.contains(t.id) { s = .working }
+            if fs == .working || autoWorking.contains(t.id) || hbActive.contains(t.id) { s = .working }
             else if fs == .done || autoDone.contains(t.id) { s = .done }
-            if fs == .idle && !autoWorking.contains(t.id) { s = .idle; autoDone.remove(t.id) }
+            if fs == .idle && !autoWorking.contains(t.id) && !hbActive.contains(t.id) { s = .idle; autoDone.remove(t.id) }
             // ✓ while you are already looking at that app → acknowledge after ~3 s
             if s == .done, front == t.path {
                 doneFrontTicks[t.id, default: 0] += 1

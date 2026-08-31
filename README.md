@@ -22,9 +22,11 @@ Kick off a long agent run, switch away, and glance at the notch: while an agent 
 
 The widened bar is itself a hover target, split by where you enter: glide in over the **notch** and you get the switcher, as always; glide in over the **widened part beside it** and the bar itself grows downward into a small status ledger — one continuous silhouette whose top corners flare out in concave curves, like it's growing out of the screen edge. One receipt row per agent (icon · name · spinner or rubber stamp), separated by ticket perforation. **Click a row to jump straight to that app**; the top strip still passes every click through to the menu bar, and the ledger retracts the moment you leave.
 
-Two signals, merged per app:
+Three signals, merged per app:
 
-1. **File protocol (precise — agents report themselves).** One word into one file:
+1. **Storage heartbeat (instant, zero-config — Claude desktop).** Cloud-side agents barely touch local CPU, but the desktop app commits the streaming conversation into claude.ai's local IndexedDB as tokens arrive — starting within about a second of you hitting send. NotchDial watches that directory's byte growth: sustained commits → *working* (lights up ~2 s after send), commits stop → *done* (~5 s after the last token). No hooks, no setup, and it tracks the real session — not your typing or scrolling.
+
+2. **File protocol (precise — agents report themselves).** One word into one file:
 
    ```bash
    mkdir -p ~/.notchdial/status
@@ -45,7 +47,7 @@ Two signals, merged per app:
 
    Codex / Cursor / anything else: any hook, wrapper script, or the agent itself running that one `echo` works the same way.
 
-2. **CPU fallback (automatic).** Sustained CPU (~9 s above threshold) from a **background** app's process tree — a local build, an export, indexing — flips it to *working* with zero setup, via pure `libproc` syscalls (nothing spawned, no permissions). The frontmost app never auto-triggers: using an app is not the same as the app working, so typing and scrolling can't produce phantom states — only file-reported states show for the app you're in. Note: cloud-side agents streaming into a background window barely touch local CPU — that's exactly what the file protocol is for.
+3. **CPU fallback (automatic).** Sustained CPU (several seconds above threshold) from a **background** app's process tree — a local build, an export, indexing — flips it to *working* with zero setup, via pure `libproc` syscalls (nothing spawned, no permissions). The frontmost app never auto-triggers: using an app is not the same as the app working, so typing and scrolling can't produce phantom states — only file-reported states show for the app you're in. Note: cloud-side agents streaming into a background window barely touch local CPU — that's exactly what the file protocol is for.
 
 Toggle: menu bar → 工作状态指示, or `defaults write com.dd.notchdial statusEnabled -bool false`.
 

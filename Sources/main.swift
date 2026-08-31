@@ -477,6 +477,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let fileGone = !FileManager.default.fileExists(atPath: fp)
         results.append(mon.states[2] == nil && fileGone ? "PASS 状态·确认后清理文件" : "FAIL 状态·确认后清理文件")
         try? FileManager.default.removeItem(atPath: mon.dirPath)
+        // heartbeat: streaming storage commits latch fast; one-off writes never trigger
+        let hb = StatusMonitor()
+        hb.dirPath = NSTemporaryDirectory() + "nd-hb-selftest-\(ProcessInfo.processInfo.processIdentifier)"
+        hb.frontmostBundlePath = { nil }
+        var hNow = Date(timeIntervalSince1970: 2_000_000)
+        var hSize: UInt64 = 100_000
+        func htick(_ grow: UInt64) {
+            hSize += grow
+            hNow = hNow.addingTimeInterval(1.0)
+            hb.hbSample(2, size: hSize, now: hNow)
+            hb.tick(cpuSample: [:], now: hNow)
+        }
+        htick(0)
+        htick(2000)
+        htick(2000)
+        results.append(hb.states[2] == .working ? "PASS 状态·心跳→秒亮" : "FAIL 状态·心跳→秒亮")
+        for _ in 0..<4 { htick(1600); htick(0); htick(0) }   // real cadence: a commit every ~3 s
+        results.append(hb.states[2] == .working ? "PASS 状态·间歇提交保持亮" : "FAIL 状态·间歇提交保持亮")
+        for _ in 0..<12 { htick(0) }
+        results.append(hb.states[2] == .done ? "PASS 状态·心跳停→出章" : "FAIL 状态·心跳停→出章")
+        hb.frontmostBundlePath = { kTargets[2].path }
+        htick(0); htick(0)
+        htick(300); htick(0); htick(0)
+        results.append(hb.states[2] == nil ? "PASS 状态·单次写不误亮" : "FAIL 状态·单次写不误亮")
+        for _ in 0..<8 { htick(0) }
+        htick(5000)
+        results.append(hb.states[2] == .working ? "PASS 状态·大提交→即亮" : "FAIL 状态·大提交→即亮")
         let e0 = IslandRoot.statusExtension(count: 0)
         let e1 = IslandRoot.statusExtension(count: 1)
         let e3 = IslandRoot.statusExtension(count: 3)
