@@ -198,40 +198,56 @@ final class StatusMonitor {
 
 // MARK: - Shared status glyphs
 
+// dim orbit track + a glowing comet arc sweeping it — reads "alive" even at a glance
 struct WorkSpinner: View {
     let tint: Color
-    var size: CGFloat = 11
-    var lineWidth: CGFloat = 1.8
+    var size: CGFloat = 16
+    var lineWidth: CGFloat = 2.4
     @State private var spin = false
     var body: some View {
-        Circle()
-            .trim(from: 0, to: 0.74)
-            .stroke(tint, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
-            .frame(width: size, height: size)
-            .rotationEffect(.degrees(spin ? 360 : 0))
-            .shadow(color: tint.opacity(0.5), radius: 3)
-            .onAppear {
-                spin = false
-                withAnimation(.linear(duration: 1.05).repeatForever(autoreverses: false)) { spin = true }
-            }
+        ZStack {
+            Circle()
+                .stroke(tint.opacity(0.22), lineWidth: lineWidth)
+            Circle()
+                .trim(from: 0, to: 0.32)
+                .stroke(tint, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                .rotationEffect(.degrees(spin ? 360 : 0))
+                .shadow(color: tint.opacity(0.85), radius: 3.5)
+        }
+        .frame(width: size, height: size)
+        .onAppear {
+            spin = false
+            withAnimation(.linear(duration: 0.9).repeatForever(autoreverses: false)) { spin = true }
+        }
     }
 }
 
+// checkmark slams in with overshoot while a shockwave ring bursts outward
 struct DoneCheck: View {
-    var size: CGFloat = 11
+    var size: CGFloat = 15
     static let green = Color(red: 0.30, green: 0.86, blue: 0.40)
     @State private var pop = false
+    @State private var burst = false
     var body: some View {
-        Image(systemName: "checkmark")
-            .font(.system(size: size, weight: .black))
-            .foregroundColor(Self.green)
-            .shadow(color: Self.green.opacity(0.85), radius: 4)
-            .scaleEffect(pop ? 1 : 0.25)
-            .opacity(pop ? 1 : 0)
-            .onAppear {
-                pop = false
-                withAnimation(.interpolatingSpring(stiffness: 420, damping: 15)) { pop = true }
-            }
+        ZStack {
+            Circle()
+                .stroke(Self.green, lineWidth: 1.8)
+                .frame(width: size * 1.2, height: size * 1.2)
+                .scaleEffect(burst ? 2.3 : 0.45)
+                .opacity(burst ? 0 : 0.9)
+            Image(systemName: "checkmark")
+                .font(.system(size: size, weight: .black))
+                .foregroundColor(Self.green)
+                .shadow(color: Self.green.opacity(0.9), radius: 5)
+                .scaleEffect(pop ? 1 : 0.15)
+                .opacity(pop ? 1 : 0)
+        }
+        .onAppear {
+            pop = false
+            burst = false
+            withAnimation(.interpolatingSpring(stiffness: 380, damping: 13)) { pop = true }
+            withAnimation(.easeOut(duration: 0.6)) { burst = true }
+        }
     }
 }
 
@@ -240,28 +256,28 @@ struct StatusBadge: View {
     let ws: WorkState
     let tint: Color
     var paper = false
-    var size: CGFloat = 11
+    var size: CGFloat = 13
     static let stampInk = Color(red: 0.13, green: 0.50, blue: 0.27)
     @State private var stamped = false
     var body: some View {
         switch ws {
         case .working:
-            WorkSpinner(tint: tint, size: size, lineWidth: paper ? 1.6 : 1.8)
+            WorkSpinner(tint: tint, size: size, lineWidth: paper ? 2.0 : 2.2)
         case .done:
             if paper {
                 ZStack {
-                    Circle().stroke(Self.stampInk, lineWidth: 1.4)
-                        .frame(width: size + 6, height: size + 6)
+                    Circle().stroke(Self.stampInk, lineWidth: 1.6)
+                        .frame(width: size + 8, height: size + 8)
                     Image(systemName: "checkmark")
-                        .font(.system(size: size * 0.74, weight: .heavy))
+                        .font(.system(size: size * 0.78, weight: .heavy))
                         .foregroundColor(Self.stampInk)
                 }
                 .rotationEffect(.degrees(-12))
                 .opacity(stamped ? 0.92 : 0)
-                .scaleEffect(stamped ? 1 : 1.9)
+                .scaleEffect(stamped ? 1 : 2.1)
                 .onAppear {
                     stamped = false
-                    withAnimation(.interpolatingSpring(stiffness: 500, damping: 22)) { stamped = true }
+                    withAnimation(.interpolatingSpring(stiffness: 460, damping: 19)) { stamped = true }
                 }
             } else {
                 DoneCheck(size: size)

@@ -35,9 +35,9 @@ struct NeonView: View {
                     Group {
                         switch state.work[t.id] ?? .idle {
                         case .working:
-                            WorkSpinner(tint: t.tint, size: 8, lineWidth: 1.5)
+                            WorkSpinner(tint: t.tint, size: 10, lineWidth: 1.8)
                         case .done:
-                            DoneCheck(size: 8)
+                            DoneCheck(size: 10)
                         case .idle:
                             Circle()
                                 .fill(t.id == state.centeredIndex ? t.tint : Color(white: 0.16))
@@ -45,7 +45,7 @@ struct NeonView: View {
                                 .shadow(color: t.id == state.centeredIndex ? t.tint : .clear, radius: 5)
                         }
                     }
-                    .frame(width: 10, height: 10)
+                    .frame(width: 13, height: 13)
                 }
             }
             .padding(.top, 2)

@@ -26,7 +26,7 @@ struct IslandRoot: View {
     }
     // how far the collapsed bar grows on EACH side of the notch
     static func statusExtension(count: Int) -> CGFloat {
-        count == 0 ? 0 : CGFloat(count) * 17 + 11
+        count == 0 ? 0 : CGFloat(count) * 28 + 16
     }
     private var capsuleExt: CGFloat { Self.statusExtension(count: statusList.count) }
 
@@ -65,33 +65,42 @@ struct IslandRoot: View {
         .shadow(color: .black.opacity(isOpen && state.mode == 1 ? 0.55 : 0), radius: 22, y: 9)
         .animation(.interpolatingSpring(stiffness: 300, damping: 24), value: isOpen)
         .animation(.interpolatingSpring(stiffness: 280, damping: 25), value: state.mode)
-        .animation(.interpolatingSpring(stiffness: 300, damping: 26), value: capsuleExt)
+        .animation(.interpolatingSpring(stiffness: 330, damping: 20), value: capsuleExt)
+        .animation(.interpolatingSpring(stiffness: 330, damping: 21), value: state.work)
     }
 
-    // collapsed live-status bar: mini icons on the left of the notch, state glyphs on the right
+    // collapsed live-status bar: app icons on the left of the notch, state glyphs on the right.
+    // Everything springs out from behind the notch, as if the black bar squeezed it out.
     @ViewBuilder private func statusCapsule(width: CGFloat, height: CGFloat) -> some View {
+        let iconS = min(22, height - 9)
         HStack(spacing: 0) {
-            HStack(spacing: 5) {
+            HStack(spacing: 6) {
                 ForEach(statusList) { e in
                     if let img = IconCache.icon(for: e.t) {
                         Image(nsImage: img)
                             .resizable()
                             .interpolation(.high)
                             .aspectRatio(contentMode: .fit)
-                            .frame(width: 13, height: 13)
-                            .shadow(color: .black.opacity(0.6), radius: 1)
+                            .frame(width: iconS, height: iconS)
+                            .shadow(color: .black.opacity(0.55), radius: 2, y: 1)
+                            .transition(.asymmetric(
+                                insertion: .move(edge: .trailing).combined(with: .scale(scale: 0.35)).combined(with: .opacity),
+                                removal: .scale(scale: 0.4).combined(with: .opacity)))
                     }
                 }
             }
-            .padding(.leading, 8)
+            .padding(.leading, 10)
             Spacer(minLength: state.notchWidth)
-            HStack(spacing: 7) {
+            HStack(spacing: 9) {
                 ForEach(statusList) { e in
-                    StatusBadge(ws: e.s, tint: e.t.tint, size: 10)
+                    StatusBadge(ws: e.s, tint: e.t.tint, size: iconS * 0.72)
                         .id("cap-\(e.t.id)-\(e.s == .working ? "w" : "d")")
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .leading).combined(with: .scale(scale: 0.35)).combined(with: .opacity),
+                            removal: .scale(scale: 0.4).combined(with: .opacity)))
                 }
             }
-            .padding(.trailing, 9)
+            .padding(.trailing, 11)
         }
         .frame(width: width, height: height)
     }

@@ -444,7 +444,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let e0 = IslandRoot.statusExtension(count: 0)
         let e1 = IslandRoot.statusExtension(count: 1)
         let e3 = IslandRoot.statusExtension(count: 3)
-        results.append(e0 == 0 && e1 > 20 && e3 > e1 ? "PASS 状态·胶囊宽度" : "FAIL 状态·胶囊宽度")
+        results.append(e0 == 0 && e1 >= 40 && e3 > e1 ? "PASS 状态·胶囊宽度" : "FAIL 状态·胶囊宽度")
         for r in results { print(r) }
         print(results.allSatisfy { $0.hasPrefix("PASS") } ? "SELFTEST ALL PASS" : "SELFTEST HAS FAILURES")
         exit(0)

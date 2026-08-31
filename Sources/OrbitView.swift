@@ -135,10 +135,10 @@ struct OrbitView: View {
             .frame(width: size, height: size)
             .overlay(alignment: .topTrailing) {
                 if let ws = state.work[tg.id], morph > 0.55, !sess, alpha > 0 {
-                    StatusBadge(ws: ws, tint: tg.tint, size: 9)
-                        .padding(3.5)
-                        .background(Circle().fill(Color.black.opacity(0.5)))
-                        .offset(x: 7, y: -5)
+                    StatusBadge(ws: ws, tint: tg.tint, size: 11)
+                        .padding(4)
+                        .background(Circle().fill(Color.black.opacity(0.55)))
+                        .offset(x: 8, y: -6)
                 }
             }
             .scaleEffect(hoverID == tg.id && isCenter && !launchingMe ? 1.07 : 1)
