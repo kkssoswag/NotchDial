@@ -504,13 +504,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for _ in 0..<8 { htick(0) }
         htick(5000)
         results.append(hb.states[2] == .working ? "PASS 状态·大提交→即亮" : "FAIL 状态·大提交→即亮")
-        // paired layout: pills split around the notch, so 2 agents cost no more width than 1
+        // stacked deck: each extra agent costs only the overlap step, never a full slot
         let e0 = IslandRoot.statusExtension(count: 0)
         let e1 = IslandRoot.statusExtension(count: 1)
         let e2 = IslandRoot.statusExtension(count: 2)
         let e3 = IslandRoot.statusExtension(count: 3)
-        results.append(e0 == 0 && e1 >= 46 && e2 == e1 && e3 > e2
-                       ? "PASS 状态·成对胶囊宽度" : "FAIL 状态·成对胶囊宽度")
+        results.append(e0 == 0 && e1 >= 46 && e2 > e1 && e3 > e2
+                       && e3 - e1 <= 2 * IslandRoot.stackStep + 1
+                       ? "PASS 状态·叠摞胶囊宽度" : "FAIL 状态·叠摞胶囊宽度")
         // collapsed hover zones: notch → switcher, widened bar → status card
         if let g = geo {
             let top = g.windowRect.maxY

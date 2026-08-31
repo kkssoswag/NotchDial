@@ -52,13 +52,13 @@ struct IslandRoot: View {
             return StatusEntry(t: t, s: s)
         }
     }
-    // how far the collapsed bar grows on EACH side of the notch. Each agent gets one
-    // pill (icon + its glyph) and the pills are split evenly left/right of the notch,
-    // so the bar stays compact and symmetric instead of stretching for a single app.
+    // how far the collapsed bar grows on EACH side of the notch. Icons fan out as an
+    // overlapping deck on the left (each extra agent costs only the overlap step), and
+    // the right side carries a single aggregate glyph — so the bar barely grows.
+    static let stackStep: CGFloat = 16
     static func statusExtension(count: Int) -> CGFloat {
         guard count > 0 else { return 0 }
-        let perSide = (count + 1) / 2          // 1 app → 1 side, 2 → 1+1, 3 → 2+1
-        return CGFloat(perSide) * 46 + 14
+        return max(46, 40 + CGFloat(count - 1) * stackStep)
     }
     private var capsuleExt: CGFloat { Self.statusExtension(count: statusList.count) }
 
@@ -114,46 +114,61 @@ struct IslandRoot: View {
         .animation(.interpolatingSpring(stiffness: 320, damping: 25), value: state.showCard)
     }
 
-    // one agent = one pill: its icon, then its own state glyph — never split apart
-    @ViewBuilder private func statusPill(_ e: StatusEntry, iconS: CGFloat) -> some View {
-        HStack(spacing: 6) {
-            if let img = IconCache.icon(for: e.t) {
-                Image(nsImage: img)
-                    .resizable()
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: iconS, height: iconS)
-                    .shadow(color: .black.opacity(0.55), radius: 2, y: 1)
+    // icons fan out as an overlapping deck, each carved out of the next by a black gutter
+    @ViewBuilder private func iconDeck(iconS: CGFloat) -> some View {
+        ZStack(alignment: .leading) {
+            ForEach(Array(statusList.enumerated()), id: \.element.id) { idx, e in
+                if let img = IconCache.icon(for: e.t) {
+                    Image(nsImage: img)
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: iconS, height: iconS)
+                        .background(
+                            RoundedRectangle(cornerRadius: iconS * 0.32, style: .continuous)
+                                .fill(Color.black)
+                                .frame(width: iconS + 5, height: iconS + 5)
+                        )
+                        .shadow(color: .black.opacity(0.6), radius: 2.5, x: 1, y: 1)
+                        .offset(x: CGFloat(idx) * Self.stackStep)
+                        // classic deck: the first card sits on top, the rest peek out behind it
+                        .zIndex(Double(statusList.count - idx))
+                        .transition(.asymmetric(
+                            insertion: .scale(scale: 0.3, anchor: .leading).combined(with: .opacity),
+                            removal: .scale(scale: 0.4, anchor: .leading).combined(with: .opacity)))
+                }
             }
-            StatusBadge(ws: e.s, tint: e.t.tint, size: iconS * 0.62)
-                .id("cap-\(e.t.id)-\(e.s == .working ? "w" : "d")")
         }
-        .transition(.asymmetric(
-            insertion: .scale(scale: 0.3).combined(with: .opacity),
-            removal: .scale(scale: 0.4).combined(with: .opacity)))
+        .frame(width: iconS + CGFloat(max(0, statusList.count - 1)) * Self.stackStep,
+               height: iconS, alignment: .leading)
     }
 
-    // collapsed live-status bar: one pill per agent, split evenly around the notch.
-    // Everything springs out from behind the notch, as if the black bar squeezed it out.
+    // one glyph speaks for the whole deck: anybody still working → spinner; all done → stamp
+    @ViewBuilder private func aggregateGlyph(size: CGFloat) -> some View {
+        let working = statusList.first { $0.s == .working }
+        Group {
+            if let w = working {
+                WorkSpinner(tint: w.t.tint, size: size, lineWidth: 2.4)
+            } else {
+                RubberStamp(size: size + 6)
+            }
+        }
+        .id(working.map { "agg-w-\($0.t.id)" } ?? "agg-done")
+    }
+
+    // collapsed live-status bar: an overlapping icon deck left of the notch, one
+    // aggregate glyph right of it. Everything springs out from behind the notch.
     // On hover the bar grows downward into a small status ledger — one line per agent,
     // rubber-stamped once its task is done. One continuous shape; nothing floats.
     @ViewBuilder private func statusCapsule(width: CGFloat, height: CGFloat, grown: Bool) -> some View {
         let iconS = min(22, state.notchHeight - 9)
-        let perSide = (statusList.count + 1) / 2
-        let left = Array(statusList.prefix(perSide))
-        let right = Array(statusList.dropFirst(perSide))
         VStack(spacing: 0) {
             HStack(spacing: 0) {
-                // each agent travels as one pill: its icon and its own glyph, side by side
-                HStack(spacing: 14) {
-                    ForEach(left) { e in statusPill(e, iconS: iconS) }
-                }
-                .padding(.leading, 12)
+                iconDeck(iconS: iconS)
+                    .padding(.leading, 12)
                 Spacer(minLength: state.notchWidth)
-                HStack(spacing: 14) {
-                    ForEach(right) { e in statusPill(e, iconS: iconS) }
-                }
-                .padding(.trailing, 12)
+                aggregateGlyph(size: iconS * 0.73)
+                    .padding(.trailing, 13)
             }
             .frame(width: width, height: state.notchHeight)
             // while the ledger is out, the strip's glyph row would just repeat it
