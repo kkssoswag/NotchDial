@@ -256,14 +256,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         if CommandLine.arguments.contains("--cardtest") {
-            // renders the hover status card (working + done rows, rubber stamp) for filming
+            // renders the grown status ledger (spinner + stamp rows) and verifies a row click
             enabled = false
+            dryLaunch = true
             let dir = statusMon.dirPath
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
             try? "working".write(toFile: (dir as NSString).appendingPathComponent("cursor"), atomically: true, encoding: .utf8)
             try? "done".write(toFile: (dir as NSString).appendingPathComponent("claude-code"), atomically: true, encoding: .utf8)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [weak self] in self?.state.showCard = true }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 7.0) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [weak self] in
+                self?.state.showCard = true
+                self?.panel?.ignoresMouseEvents = false
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.6) { [weak self] in
+                // synthetic click on the second ledger row (Claude Code · done)
+                guard let self = self, let p = self.panel else { return }
+                let yTop = self.state.notchHeight + 34 + 1 + 17
+                let pt = NSPoint(x: p.frame.width / 2, y: p.frame.height - yTop)
+                let ts = ProcessInfo.processInfo.systemUptime
+                if let dn = NSEvent.mouseEvent(with: .leftMouseDown, location: pt, modifierFlags: [],
+                                               timestamp: ts, windowNumber: p.windowNumber, context: nil,
+                                               eventNumber: 0, clickCount: 1, pressure: 1) { p.sendEvent(dn) }
+                if let up = NSEvent.mouseEvent(with: .leftMouseUp, location: pt, modifierFlags: [],
+                                               timestamp: ts + 0.05, windowNumber: p.windowNumber, context: nil,
+                                               eventNumber: 0, clickCount: 1, pressure: 1) { p.sendEvent(up) }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6.4) { [weak self] in self?.state.showCard = true }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 9.0) {
                 for s in ["claude-code", "cursor", "codex"] {
                     try? FileManager.default.removeItem(atPath: (dir as NSString).appendingPathComponent(s))
                 }
@@ -515,7 +533,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         p.ignoresMouseEvents = (state.phase == .collapsed)
         let root = IslandRoot(state: state,
                               onLaunch: { [weak self] t in self?.launch(t) },
-                              onTapItem: { [weak self] i in self?.rotateTo(i) })
+                              onTapItem: { [weak self] i in self?.rotateTo(i) },
+                              onCardTap: { [weak self] t in self?.launchFromCard(t) })
         let host = PassthroughHostingView(rootView: root)
         host.frame = NSRect(origin: .zero, size: g.windowRect.size)
         p.contentView = host
@@ -561,9 +580,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 expand()
             case 2:
                 if !state.showCard { state.showCard = true }
+                panel?.ignoresMouseEvents = true   // still in the top strip: menu bar stays clickable
             default:
-                if state.showCard && !statusCardRect().insetBy(dx: -26, dy: -26).contains(m) {
-                    state.showCard = false
+                if state.showCard {
+                    let card = statusCardRect()
+                    if card.insetBy(dx: -26, dy: -26).contains(m) {
+                        // in the grown ledger below the strip: rows take clicks
+                        let inStrip = m.y > g.windowRect.maxY - state.notchHeight - 2
+                        panel?.ignoresMouseEvents = inStrip || !card.contains(m)
+                    } else {
+                        state.showCard = false
+                        panel?.ignoresMouseEvents = true
+                    }
                 }
             }
         case .expanded:
@@ -641,6 +669,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self = self, !self.pinned else { self?.state.phase = .expanded; return }
             self.collapse()
         }
+    }
+
+    // a click on a ledger row jumps straight to that app
+    func launchFromCard(_ t: AppTarget) {
+        if dryLaunch { print("CARDCLICK->\(t.name)"); state.showCard = false; return }
+        NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .default)
+        Launcher.launch(t)
+        state.showCard = false
+        panel?.ignoresMouseEvents = true
     }
 
     func refreshRunning(force: Bool = false) {

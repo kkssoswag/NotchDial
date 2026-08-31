@@ -208,13 +208,13 @@ struct TicketView: View {
                     .rotationEffect(.degrees(90))
                     .position(x: TW / 2, y: 104)
                 dashRow(acc).position(x: TW / 2, y: 148)
-                if state.runningIDs.contains(i) {
+                if let ws = state.work[i] {
+                    // status lives where the running dot sits — part of the ticket's own layout
+                    StatusBadge(ws: ws, tint: acc, paper: true, size: 11)
+                        .position(x: TW / 2, y: 160)
+                } else if state.runningIDs.contains(i) {
                     Circle().fill(acc).frame(width: 4, height: 4)
                         .position(x: TW / 2, y: 160)
-                }
-                if let ws = state.work[i] {
-                    StatusBadge(ws: ws, tint: acc, paper: true, size: 12)
-                        .position(x: TW - 15, y: 17)
                 }
                 Line()
                     .stroke(Self.ink.opacity(0.4), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
