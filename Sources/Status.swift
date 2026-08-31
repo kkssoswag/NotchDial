@@ -23,6 +23,11 @@ final class StatusMonitor {
     var minWorkForDone: TimeInterval = 8   // shorter bursts end silently, not with a ✓
     var workingTTL: TimeInterval = 30 * 60 // stale "working" files are ignored (crashed agent)
     var doneTTL: TimeInterval = 12 * 3600
+    // How long a finished stamp stays visible when you are ALREADY looking at that
+    // app. Counted from completion, in seconds — not in poll ticks: publish() runs
+    // more than once per second, so a tick counter made the stamp flash for under a
+    // second and the completion went unnoticed.
+    var doneLinger: TimeInterval = 8
 
     var dirPath = (NSHomeDirectory() as NSString).appendingPathComponent(".notchdial/status")
     var frontmostBundlePath: () -> String? = { NSWorkspace.shared.frontmostApplication?.bundleURL?.path }
@@ -76,7 +81,7 @@ final class StatusMonitor {
     private var autoWorking: Set<Int> = []
     private var autoDone: Set<Int> = []
     private var workStart: [Int: Date] = [:]
-    private var doneFrontTicks: [Int: Int] = [:]
+    private var doneAt: [Int: Date] = [:]
 
     static func slug(_ t: AppTarget) -> String {
         t.name.lowercased().replacingOccurrences(of: " ", with: "-")
@@ -122,7 +127,9 @@ final class StatusMonitor {
                   let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
                   let path = app.bundleURL?.path else { return }
             for t in kTargets where t.path == path && self.states[t.id] == .done {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                let shown = self.doneAt[t.id].map { Date().timeIntervalSince($0) } ?? 0
+                let wait = max(1.5, self.doneLinger - shown)
+                DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
                     guard let self = self, self.states[t.id] == .done else { return }
                     self.clearDone(t)
                 }
@@ -134,7 +141,7 @@ final class StatusMonitor {
     func stop() {
         timer?.invalidate(); timer = nil
         states = [:]; autoWorking = []; autoDone = []
-        hot = [:]; cold = [:]; prevCPU = [:]; prevTime = nil; doneFrontTicks = [:]
+        hot = [:]; cold = [:]; prevCPU = [:]; prevTime = nil; doneAt = [:]
         hbPrevSize = [:]; hbLastEvent = [:]; hbPrevEvent = [:]; hbActive = []; hbStart = [:]
         axBusy = []; axUsable = []; axStart = [:]
         onChange?(states)
@@ -142,7 +149,7 @@ final class StatusMonitor {
 
     func clearDone(_ t: AppTarget) {
         autoDone.remove(t.id)
-        doneFrontTicks[t.id] = nil
+        doneAt[t.id] = nil
         removeFile(t)
         publish()
     }
@@ -250,7 +257,7 @@ final class StatusMonitor {
             }
         }
         if !res.isEmpty { log("AX res=\(res.map { "\($0.key):\($0.value.0 ? "BUSY" : "idle")/\($0.value.1)n" }.sorted()) usable=\(axUsable.sorted()) busy=\(axBusy.sorted())") }
-        publish()
+        publish(now: now)
     }
 
     // one sampling step; cpuSample/now injectable for the self-test
@@ -293,10 +300,10 @@ final class StatusMonitor {
         }
         prevCPU = cpu
         prevTime = now
-        publish()
+        publish(now: now)
     }
 
-    private func publish() {
+    private func publish(now: Date = Date()) {
         var out: [Int: WorkState] = [:]
         let front = frontmostBundlePath()
         for t in kTargets {
@@ -310,16 +317,19 @@ final class StatusMonitor {
             if fs == .working || live { s = .working }
             else if fs == .done || autoDone.contains(t.id) { s = .done }
             if fs == .idle && !live { s = .idle; autoDone.remove(t.id) }
-            // ✓ while you are already looking at that app → acknowledge after ~3 s
-            if s == .done, front == t.path {
-                doneFrontTicks[t.id, default: 0] += 1
-                if doneFrontTicks[t.id, default: 0] >= 2 {
+            // The stamp is the completion feedback, so it must be seen. Give it
+            // doneLinger seconds on screen; only then does being in that app count
+            // as having acknowledged it. Away from the app it waits indefinitely.
+            if s == .done {
+                let at = doneAt[t.id] ?? now
+                if doneAt[t.id] == nil { doneAt[t.id] = at }
+                if front == t.path, now.timeIntervalSince(at) >= doneLinger {
                     autoDone.remove(t.id); removeFile(t)
-                    doneFrontTicks[t.id] = nil
+                    doneAt[t.id] = nil
                     s = .idle
                 }
             } else {
-                doneFrontTicks[t.id] = nil
+                doneAt[t.id] = nil
             }
             if s != .idle { out[t.id] = s }
         }

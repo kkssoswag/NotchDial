@@ -445,6 +445,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mon.dirPath = NSTemporaryDirectory() + "nd-status-selftest-\(ProcessInfo.processInfo.processIdentifier)"
         try? FileManager.default.createDirectory(atPath: mon.dirPath, withIntermediateDirectories: true)
         mon.frontmostBundlePath = { nil }
+        mon.doneLinger = 2
         var mNow = Date(timeIntervalSince1970: 1_000_000)
         var mCum = 0.0
         func mtick(_ util: Double) {
@@ -484,6 +485,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let hb = StatusMonitor()
         hb.dirPath = NSTemporaryDirectory() + "nd-hb-selftest-\(ProcessInfo.processInfo.processIdentifier)"
         hb.frontmostBundlePath = { nil }
+        hb.doneLinger = 2
         var hNow = Date(timeIntervalSince1970: 2_000_000)
         var hSize: UInt64 = 100_000
         func htick(_ grow: UInt64) {
@@ -535,6 +537,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         results.append(axm.states[0] == .done ? "PASS 状态·AX收工→出章" : "FAIL 状态·AX收工→出章")
         atick(true, nodes: 90); atick(false, nodes: 90, step: 1)
         results.append(axm.states[0] == nil ? "PASS 状态·AX短任务不出章" : "FAIL 状态·AX短任务不出章")
+        // a stamp must stay on screen long enough to be seen, even if you never left
+        let lm = StatusMonitor()
+        lm.dirPath = NSTemporaryDirectory() + "nd-linger-selftest-\(ProcessInfo.processInfo.processIdentifier)"
+        lm.axEnabled = false
+        lm.doneLinger = 4
+        lm.frontmostBundlePath = { kTargets[0].path }   // you are sitting in that app
+        var lNow = Date(timeIntervalSince1970: 4_000_000)
+        func ltick(_ busy: Bool, _ step: TimeInterval = 1) {
+            lNow = lNow.addingTimeInterval(step)
+            lm.applyAX([0: (busy, 90)], now: lNow)
+        }
+        for _ in 0..<10 { ltick(true) }
+        ltick(false)
+        let stamped = lm.states[0] == .done
+        ltick(false); ltick(false)
+        let stillThere = lm.states[0] == .done      // 2 s in, must still be visible
+        for _ in 0..<4 { ltick(false) }
+        let gone = lm.states[0] == nil              // past the linger, acknowledged
+        results.append(stamped && stillThere && gone
+                       ? "PASS 状态·盖章停留够久" : "FAIL 状态·盖章停留够久(\(stamped),\(stillThere),\(gone))")
+        try? FileManager.default.removeItem(atPath: lm.dirPath)
         try? FileManager.default.removeItem(atPath: axm.dirPath)
         // stacked deck: each extra agent costs only the overlap step, never a full slot
         let e0 = IslandRoot.statusExtension(count: 0)
