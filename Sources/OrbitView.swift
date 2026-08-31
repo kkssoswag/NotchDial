@@ -37,6 +37,25 @@ struct OrbitView: View {
             TimelineView(.animation(minimumInterval: 1.0 / 40.0)) { tl in
                 let t = tl.date.timeIntervalSinceReferenceDate
                 Canvas { ctx, _ in
+                    // The nebula layers are drawn wider than this canvas so their own
+                    // soft edges land outside it — which left a hard-cut rectangle of
+                    // haze sitting on the desktop. Clip everything to an ellipse that
+                    // is opaque at the notch and fully transparent at the island's
+                    // left, right and bottom edges, so the scene has no border at all.
+                    ctx.clipToLayer { c in
+                        c.scaleBy(x: 1, y: H / (W / 2))
+                        c.fill(Path(ellipseIn: CGRect(x: 0, y: -W / 2, width: W, height: W)),
+                               with: .radialGradient(
+                                   Gradient(stops: [
+                                       .init(color: .white, location: 0),
+                                       .init(color: .white, location: 0.5),
+                                       .init(color: .white.opacity(0.34), location: 0.8),
+                                       .init(color: .white.opacity(0), location: 1),
+                                   ]),
+                                   center: CGPoint(x: W / 2, y: 0),
+                                   startRadius: 0,
+                                   endRadius: W / 2))
+                    }
                     drawSpace(&ctx, t: t)
                 }
             }

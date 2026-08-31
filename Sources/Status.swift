@@ -39,6 +39,11 @@ final class StatusMonitor {
     ]
     // Real-world pattern (measured): commits arrive in intermittent batches, every
     // 2–5 s while a session streams, up to ~6 KB each, dead silent when idle.
+    // OFF by default: the controlled experiment showed storage writes are *higher*
+    // while the agent is idle, so this signal lies more often than it helps. Kept
+    // behind `defaults write com.dd.notchdial statusHeartbeat -bool true` only for
+    // apps that persist locally in a way that really does track their work.
+    var hbEnabled = UserDefaults.standard.bool(forKey: "statusHeartbeat")
     var hbGrowthOn: UInt64 = 256          // bytes of growth that count as one commit event
     var hbEventGap: TimeInterval = 6      // two commits this close together = live session
     var hbBigCommit: UInt64 = 4096        // a single commit this large latches instantly (the send itself)
@@ -103,7 +108,7 @@ final class StatusMonitor {
         let tm = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(tm, forMode: .common)
         timer = tm
-        log("START axEnabled=\(axEnabled) trusted=\(AXStatus.trusted()) hbDirs=\(hbDir.count) pids=\(kTargets.compactMap { AXStatus.pid(for: $0) })")
+        log("START axEnabled=\(axEnabled) trusted=\(AXStatus.trusted()) hb=\(hbEnabled) hbDirs=\(hbDir.count) pids=\(kTargets.compactMap { AXStatus.pid(for: $0) })")
         // Exact status needs one Accessibility grant. Ask once, ever; the menu item
         // stays available for later. Without it we quietly fall back to guessing.
         if axEnabled, !AXStatus.trusted(), !UserDefaults.standard.bool(forKey: "axPromptShown") {
@@ -251,7 +256,9 @@ final class StatusMonitor {
     // one sampling step; cpuSample/now injectable for the self-test
     func tick(cpuSample: [Int: Double]? = nil, now: Date = Date()) {
         pollAX()
-        for (id, dir) in hbDir where !axUsable.contains(id) { hbSample(id, size: hbTotalSize(dir), now: now) }
+        if hbEnabled {
+            for (id, dir) in hbDir where !axUsable.contains(id) { hbSample(id, size: hbTotalSize(dir), now: now) }
+        }
         let cpu = cpuSample ?? Self.cpuSecondsByTarget()
         let front = frontmostBundlePath()
         if let pt = prevTime, now > pt {
