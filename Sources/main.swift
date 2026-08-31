@@ -434,7 +434,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mtick(0)
         for _ in 0..<3 { mtick(0) }
         results.append(mon.states[0] == nil ? "PASS 状态·初始空闲" : "FAIL 状态·初始空闲")
-        for _ in 0..<3 { mtick(0.9) }
+        for _ in 0..<5 { mtick(0.9) }
         results.append(mon.states[0] == nil ? "PASS 状态·短脉冲不触发" : "FAIL 状态·短脉冲不触发")
         mtick(0.9)
         results.append(mon.states[0] == .working ? "PASS 状态·持续高载→工作中" : "FAIL 状态·持续高载→工作中")
@@ -444,6 +444,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mon.frontmostBundlePath = { kTargets[0].path }
         mtick(0); mtick(0)
         results.append(mon.states[0] == nil ? "PASS 状态·看过后清除" : "FAIL 状态·看过后清除")
+        for _ in 0..<10 { mtick(0.9) }   // still frontmost: heavy use must never read as work
+        results.append(mon.states[0] == nil ? "PASS 状态·前台使用不误报" : "FAIL 状态·前台使用不误报")
         mon.frontmostBundlePath = { nil }
         let fp = (mon.dirPath as NSString).appendingPathComponent("claude-code")
         try? "working".write(toFile: fp, atomically: true, encoding: .utf8)
@@ -536,13 +538,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return cap.contains(m) ? 2 : 0
     }
 
+    // the grown bar's global rect — the hover keep-alive region while the ledger is out
     func statusCardRect() -> NSRect {
         guard let g = geo else { return .zero }
-        let rows = max(1, state.work.count)
-        let h = CGFloat(rows) * 58 + 14
-        return NSRect(x: g.windowRect.midX - 165,
-                      y: g.windowRect.maxY - state.notchHeight - 8 - h,
-                      width: 330, height: h)
+        let n = state.work.count
+        let ext = IslandRoot.statusExtension(count: n)
+        let h = state.notchHeight + IslandRoot.statusGrowth(rows: n)
+        return NSRect(x: g.windowRect.midX - state.notchWidth / 2 - ext,
+                      y: g.windowRect.maxY - h,
+                      width: state.notchWidth + 2 * ext,
+                      height: h)
     }
 
     func mouseMoved() {

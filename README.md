@@ -20,7 +20,7 @@ https://github.com/user-attachments/assets/39c76579-0f78-4b29-822e-a5045ef01156
 
 Kick off a long agent run, switch away, and glance at the notch: while an agent works, the black bar grows well past the notch — its app icon on the left, a spinner in the app's color on the right. When the task finishes, the spinner pops into a **green ✓ that stays until you actually switch to that app** (or it auto-clears a few seconds after you're already there). Expanded, each mode speaks its own dialect: a rubber-stamped ✓ on the paper ticket, a badge on the orbit icon, a neon tick under the sign.
 
-The widened bar is itself a hover target, split by where you enter: glide in over the **notch** and you get the switcher, as always; glide in over the **widened part beside it** and a status card drops down instead — app icon, name, state, a live spinner per working agent, and a big rubber stamp slammed onto every finished one. The card is pure display: it never steals clicks from whatever is under it.
+The widened bar is itself a hover target, split by where you enter: glide in over the **notch** and you get the switcher, as always; glide in over the **widened part beside it** and the bar itself grows downward into a small status ledger — one continuous shape, like the notch putting out a receipt: one line per agent (`Claude Code · 任务完成`), rubber-stamped once its task is done. Pure display: it never steals clicks from whatever is under it, and it retracts the moment you leave.
 
 Two signals, merged per app:
 
@@ -45,7 +45,7 @@ Two signals, merged per app:
 
    Codex / Cursor / anything else: any hook, wrapper script, or the agent itself running that one `echo` works the same way.
 
-2. **CPU fallback (automatic).** Sustained CPU from an app's process tree — a local build, an export, indexing — flips it to *working* with zero setup, via pure `libproc` syscalls (nothing spawned, no permissions). Sustained-threshold hysteresis filters out typing and scrolling bursts. Note: cloud-side agents streaming into a background window barely touch local CPU — that's exactly what the file protocol is for.
+2. **CPU fallback (automatic).** Sustained CPU (~9 s above threshold) from a **background** app's process tree — a local build, an export, indexing — flips it to *working* with zero setup, via pure `libproc` syscalls (nothing spawned, no permissions). The frontmost app never auto-triggers: using an app is not the same as the app working, so typing and scrolling can't produce phantom states — only file-reported states show for the app you're in. Note: cloud-side agents streaming into a background window barely touch local CPU — that's exactly what the file protocol is for.
 
 Toggle: menu bar → 工作状态指示, or `defaults write com.dd.notchdial statusEnabled -bool false`.
 

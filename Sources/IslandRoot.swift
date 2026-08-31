@@ -31,10 +31,17 @@ struct IslandRoot: View {
     }
     private var capsuleExt: CGFloat { Self.statusExtension(count: statusList.count) }
 
+    // extra height when the bar grows into its status ledger (hover on the widened part)
+    static func statusGrowth(rows: Int) -> CGFloat {
+        rows == 0 ? 0 : CGFloat(rows) * 30 + CGFloat(rows - 1) * 2 + 10
+    }
+
     private var island: some View {
         let ext = isOpen ? 0 : capsuleExt
-        let sz = isOpen ? state.openSize() : CGSize(width: state.notchWidth + 2 * ext, height: state.notchHeight)
-        let r: CGFloat = isOpen ? 34 : 10
+        let grown = !isOpen && state.showCard && !statusList.isEmpty
+        let growH = grown ? Self.statusGrowth(rows: statusList.count) : 0
+        let sz = isOpen ? state.openSize() : CGSize(width: state.notchWidth + 2 * ext, height: state.notchHeight + growH)
+        let r: CGFloat = isOpen ? 34 : (grown ? 19 : 10)
         let shape = UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: r,
                                            bottomTrailingRadius: r, topTrailingRadius: 0, style: .continuous)
         return ZStack(alignment: .top) {
@@ -56,113 +63,84 @@ struct IslandRoot: View {
                 }
             }
             if !isOpen && ext > 0 {
-                statusCapsule(width: sz.width, height: sz.height)
+                statusCapsule(width: sz.width, height: sz.height, grown: grown)
                     .transition(.opacity)
             }
             shape.strokeBorder(Color.white.opacity(isOpen && state.mode == 1 ? 0.09 : 0), lineWidth: 1)
         }
         .frame(width: sz.width, height: sz.height)
         .compositingGroup()
-        .shadow(color: .black.opacity(isOpen && state.mode == 1 ? 0.55 : 0), radius: 22, y: 9)
+        .shadow(color: .black.opacity(isOpen ? (state.mode == 1 ? 0.55 : 0) : (grown ? 0.38 : 0)),
+                radius: isOpen ? 22 : 14, y: isOpen ? 9 : 6)
         .animation(.interpolatingSpring(stiffness: 300, damping: 24), value: isOpen)
         .animation(.interpolatingSpring(stiffness: 280, damping: 25), value: state.mode)
         .animation(.interpolatingSpring(stiffness: 330, damping: 20), value: capsuleExt)
         .animation(.interpolatingSpring(stiffness: 330, damping: 21), value: state.work)
-        .overlay(alignment: .top) {
-            if !isOpen && state.showCard && !statusList.isEmpty {
-                statusCardView
-                    .offset(y: sz.height + 8)
-                    .transition(.move(edge: .top).combined(with: .scale(scale: 0.92, anchor: .top)).combined(with: .opacity))
-            }
-        }
-        .animation(.interpolatingSpring(stiffness: 340, damping: 26), value: state.showCard)
-    }
-
-    // hover card: one row per active agent — icon, name, state, and a spinner or a rubber stamp
-    @ViewBuilder private var statusCardView: some View {
-        VStack(spacing: 0) {
-            ForEach(statusList) { e in
-                HStack(spacing: 12) {
-                    if let img = IconCache.icon(for: e.t) {
-                        Image(nsImage: img)
-                            .resizable()
-                            .interpolation(.high)
-                            .aspectRatio(contentMode: .fit)
-                            .frame(width: 34, height: 34)
-                            .shadow(color: .black.opacity(0.5), radius: 2, y: 1)
-                    }
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(e.t.name)
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundColor(.white)
-                        Text(e.s == .working ? "正在工作…" : "任务完成")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(e.s == .working ? Color(white: 0.62) : RubberStamp.green.opacity(0.95))
-                    }
-                    Spacer(minLength: 0)
-                    if e.s == .working {
-                        WorkSpinner(tint: e.t.tint, size: 20, lineWidth: 2.6)
-                            .padding(.trailing, 6)
-                    } else {
-                        RubberStamp(size: 44)
-                    }
-                }
-                .padding(.horizontal, 16)
-                .frame(height: 58)
-                if e.id != statusList.last?.id {
-                    Rectangle().fill(Color.white.opacity(0.07))
-                        .frame(height: 1)
-                        .padding(.horizontal, 14)
-                }
-            }
-        }
-        .padding(.vertical, 7)
-        .frame(width: 330)
-        .background(
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .fill(Color.black)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .stroke(Color.white.opacity(0.09), lineWidth: 1)
-                )
-        )
-        .shadow(color: .black.opacity(0.5), radius: 18, y: 8)
+        .animation(.interpolatingSpring(stiffness: 320, damping: 25), value: state.showCard)
     }
 
     // collapsed live-status bar: app icons on the left of the notch, state glyphs on the right.
     // Everything springs out from behind the notch, as if the black bar squeezed it out.
-    @ViewBuilder private func statusCapsule(width: CGFloat, height: CGFloat) -> some View {
-        let iconS = min(22, height - 9)
-        HStack(spacing: 0) {
-            HStack(spacing: 6) {
-                ForEach(statusList) { e in
-                    if let img = IconCache.icon(for: e.t) {
-                        Image(nsImage: img)
-                            .resizable()
-                            .interpolation(.high)
-                            .aspectRatio(contentMode: .fit)
-                            .frame(width: iconS, height: iconS)
-                            .shadow(color: .black.opacity(0.55), radius: 2, y: 1)
+    // On hover the bar grows downward into a small status ledger — one line per agent,
+    // rubber-stamped once its task is done. One continuous shape; nothing floats.
+    @ViewBuilder private func statusCapsule(width: CGFloat, height: CGFloat, grown: Bool) -> some View {
+        let iconS = min(22, state.notchHeight - 9)
+        VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                HStack(spacing: 6) {
+                    ForEach(statusList) { e in
+                        if let img = IconCache.icon(for: e.t) {
+                            Image(nsImage: img)
+                                .resizable()
+                                .interpolation(.high)
+                                .aspectRatio(contentMode: .fit)
+                                .frame(width: iconS, height: iconS)
+                                .shadow(color: .black.opacity(0.55), radius: 2, y: 1)
+                                .transition(.asymmetric(
+                                    insertion: .move(edge: .trailing).combined(with: .scale(scale: 0.35)).combined(with: .opacity),
+                                    removal: .scale(scale: 0.4).combined(with: .opacity)))
+                        }
+                    }
+                }
+                .padding(.leading, 10)
+                Spacer(minLength: state.notchWidth)
+                HStack(spacing: 9) {
+                    ForEach(statusList) { e in
+                        StatusBadge(ws: e.s, tint: e.t.tint, size: iconS * 0.72)
+                            .id("cap-\(e.t.id)-\(e.s == .working ? "w" : "d")")
                             .transition(.asymmetric(
-                                insertion: .move(edge: .trailing).combined(with: .scale(scale: 0.35)).combined(with: .opacity),
+                                insertion: .move(edge: .leading).combined(with: .scale(scale: 0.35)).combined(with: .opacity),
                                 removal: .scale(scale: 0.4).combined(with: .opacity)))
                     }
                 }
+                .padding(.trailing, 11)
             }
-            .padding(.leading, 10)
-            Spacer(minLength: state.notchWidth)
-            HStack(spacing: 9) {
-                ForEach(statusList) { e in
-                    StatusBadge(ws: e.s, tint: e.t.tint, size: iconS * 0.72)
-                        .id("cap-\(e.t.id)-\(e.s == .working ? "w" : "d")")
-                        .transition(.asymmetric(
-                            insertion: .move(edge: .leading).combined(with: .scale(scale: 0.35)).combined(with: .opacity),
-                            removal: .scale(scale: 0.4).combined(with: .opacity)))
+            .frame(width: width, height: state.notchHeight)
+            if grown {
+                VStack(spacing: 2) {
+                    ForEach(statusList) { e in
+                        HStack(spacing: 8) {
+                            Text(e.t.name)
+                                .font(.system(size: 12.5, weight: .semibold))
+                                .foregroundColor(.white.opacity(0.95))
+                            Text("·")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(Color(white: 0.45))
+                            Text(e.s == .working ? "正在工作…" : "任务完成")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(e.s == .working ? Color(white: 0.65) : RubberStamp.green)
+                            if e.s == .done {
+                                RubberStamp(size: 24)
+                            }
+                        }
+                        .frame(height: 30)
+                    }
                 }
+                .padding(.bottom, 10)
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
-            .padding(.trailing, 11)
         }
-        .frame(width: width, height: height)
+        .frame(width: width, height: height, alignment: .top)
     }
 
     @ViewBuilder private var content: some View {

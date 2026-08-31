@@ -16,9 +16,9 @@ enum WorkState: Equatable { case idle, working, done }
 
 final class StatusMonitor {
     // tunables
-    var cpuOn = 0.20                       // ≥ this utilization (1.0 = one core) is a hot sample
+    var cpuOn = 0.30                       // ≥ this utilization (1.0 = one core) is a hot sample
     var cpuOff = 0.06                      // ≤ this is a cold sample; between = ambiguous
-    var hotNeeded = 4                      // consecutive hot samples to latch working (~6 s)
+    var hotNeeded = 6                      // consecutive hot samples to latch working (~9 s)
     var coldNeeded = 4                     // consecutive cold samples to release
     var minWorkForDone: TimeInterval = 8   // shorter bursts end silently, not with a ✓
     var workingTTL: TimeInterval = 30 * 60 // stale "working" files are ignored (crashed agent)
@@ -105,12 +105,19 @@ final class StatusMonitor {
     // one sampling step; cpuSample/now injectable for the self-test
     func tick(cpuSample: [Int: Double]? = nil, now: Date = Date()) {
         let cpu = cpuSample ?? Self.cpuSecondsByTarget()
+        let front = frontmostBundlePath()
         if let pt = prevTime, now > pt {
             let dt = now.timeIntervalSince(pt)
             for t in kTargets {
                 let prev = prevCPU[t.id] ?? (cpu[t.id] ?? 0)
                 let util = max(0, (cpu[t.id] ?? 0) - prev) / dt
-                if util >= cpuOn { hot[t.id, default: 0] += 1; cold[t.id] = 0 }
+                // The frontmost app is being *used*, which is not the same as *working*:
+                // typing, scrolling and rendering all burn CPU. Auto detection therefore
+                // only ever applies to background apps; file-reported states always win.
+                if front == t.path {
+                    hot[t.id] = 0
+                    autoWorking.remove(t.id)
+                } else if util >= cpuOn { hot[t.id, default: 0] += 1; cold[t.id] = 0 }
                 else if util <= cpuOff { cold[t.id, default: 0] += 1; hot[t.id] = 0 }
                 else { hot[t.id] = 0; cold[t.id] = 0 }
                 if !autoWorking.contains(t.id), hot[t.id, default: 0] >= hotNeeded {
