@@ -36,6 +36,7 @@ final class IslandState: ObservableObject {
     @Published var notchHeight: CGFloat = 32
     @Published var runningIDs: Set<Int> = []
     @Published var work: [Int: WorkState] = [:]   // agent status: only non-idle entries
+    @Published var showCard = false               // status card, revealed by hovering the widened bar
 
     var centeredIndex: Int {
         let n = kTargets.count
@@ -254,6 +255,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 NSApp.terminate(nil)
             }
         }
+        if CommandLine.arguments.contains("--cardtest") {
+            // renders the hover status card (working + done rows, rubber stamp) for filming
+            enabled = false
+            let dir = statusMon.dirPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? "working".write(toFile: (dir as NSString).appendingPathComponent("cursor"), atomically: true, encoding: .utf8)
+            try? "done".write(toFile: (dir as NSString).appendingPathComponent("claude-code"), atomically: true, encoding: .utf8)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [weak self] in self?.state.showCard = true }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 7.0) {
+                for s in ["claude-code", "cursor", "codex"] {
+                    try? FileManager.default.removeItem(atPath: (dir as NSString).appendingPathComponent(s))
+                }
+                NSApp.terminate(nil)
+            }
+        }
         if let fi = CommandLine.arguments.firstIndex(of: "--film"), fi + 1 < CommandLine.arguments.count {
             let dir = CommandLine.arguments[fi + 1]
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -444,7 +460,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let e0 = IslandRoot.statusExtension(count: 0)
         let e1 = IslandRoot.statusExtension(count: 1)
         let e3 = IslandRoot.statusExtension(count: 3)
-        results.append(e0 == 0 && e1 >= 40 && e3 > e1 ? "PASS 状态·胶囊宽度" : "FAIL 状态·胶囊宽度")
+        results.append(e0 == 0 && e1 >= 70 && e3 > e1 ? "PASS 状态·胶囊宽度" : "FAIL 状态·胶囊宽度")
+        // collapsed hover zones: notch → switcher, widened bar → status card
+        if let g = geo {
+            let top = g.windowRect.maxY
+            let cx = g.windowRect.midX
+            let sideX = cx + state.notchWidth / 2 + 40   // inside ext(1)=76, outside the notch
+            let z1 = collapsedZone(NSPoint(x: cx, y: top - 10), extCount: 1)
+            let z2 = collapsedZone(NSPoint(x: sideX, y: top - 10), extCount: 1)
+            let z0 = collapsedZone(NSPoint(x: sideX, y: top - 10), extCount: 0)
+            results.append(z1 == 1 ? "PASS 状态·刘海入口→切换器" : "FAIL 状态·刘海入口→切换器")
+            results.append(z2 == 2 ? "PASS 状态·延长区入口→卡片" : "FAIL 状态·延长区入口→卡片")
+            results.append(z0 == 0 ? "PASS 状态·无状态时延长区无效" : "FAIL 状态·无状态时延长区无效")
+        }
         for r in results { print(r) }
         print(results.allSatisfy { $0.hasPrefix("PASS") } ? "SELFTEST ALL PASS" : "SELFTEST HAS FAILURES")
         exit(0)
@@ -494,12 +522,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel = p
     }
 
+    // collapsed hover zones: 1 = the notch itself → open the switcher;
+    // 2 = the widened status bar beside it → reveal the status card; 0 = neither.
+    func collapsedZone(_ m: NSPoint, extCount: Int) -> Int {
+        guard let g = geo else { return 0 }
+        if g.notchRect.insetBy(dx: -8, dy: 0).contains(m) { return 1 }
+        let ext = IslandRoot.statusExtension(count: extCount)
+        guard ext > 0 else { return 0 }
+        let cap = NSRect(x: g.windowRect.midX - state.notchWidth / 2 - ext,
+                         y: g.windowRect.maxY - state.notchHeight,
+                         width: state.notchWidth + 2 * ext,
+                         height: state.notchHeight)
+        return cap.contains(m) ? 2 : 0
+    }
+
+    func statusCardRect() -> NSRect {
+        guard let g = geo else { return .zero }
+        let rows = max(1, state.work.count)
+        let h = CGFloat(rows) * 58 + 14
+        return NSRect(x: g.windowRect.midX - 165,
+                      y: g.windowRect.maxY - state.notchHeight - 8 - h,
+                      width: 330, height: h)
+    }
+
     func mouseMoved() {
         guard enabled, let g = geo else { return }
         let m = NSEvent.mouseLocation
         switch state.phase {
         case .collapsed:
-            if g.notchRect.insetBy(dx: -8, dy: 0).contains(m) { expand() }
+            switch collapsedZone(m, extCount: state.work.count) {
+            case 1:
+                state.showCard = false
+                expand()
+            case 2:
+                if !state.showCard { state.showCard = true }
+            default:
+                if state.showCard && !statusCardRect().insetBy(dx: -26, dy: -26).contains(m) {
+                    state.showCard = false
+                }
+            }
         case .expanded:
             let island = islandRectGlobal()
             let nearNotch = g.notchRect.insetBy(dx: -8, dy: 0).contains(m)
@@ -539,6 +600,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func expand() {
         state.phase = .expanded
+        state.showCard = false
         panel?.ignoresMouseEvents = false
         panel?.orderFrontRegardless()
         refreshRunning(force: true)
@@ -546,6 +608,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func collapse() {
         state.phase = .collapsed
+        state.showCard = false
         panel?.ignoresMouseEvents = true
         gestureAcc = 0
         stepsInGesture = 0

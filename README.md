@@ -18,7 +18,9 @@ https://github.com/user-attachments/assets/39c76579-0f78-4b29-822e-a5045ef01156
 
 ## 🟢 Live agent status in the notch
 
-Kick off a long agent run, switch away, and glance at the notch: while an agent works, the black bar quietly widens — its app icon on the left, a spinner in the app's color on the right. When the task finishes, the spinner pops into a **green ✓ that stays until you actually switch to that app** (or it auto-clears a few seconds after you're already there). Expanded, each mode speaks its own dialect: a rubber-stamped ✓ on the paper ticket, a badge on the orbit icon, a neon tick under the sign.
+Kick off a long agent run, switch away, and glance at the notch: while an agent works, the black bar grows well past the notch — its app icon on the left, a spinner in the app's color on the right. When the task finishes, the spinner pops into a **green ✓ that stays until you actually switch to that app** (or it auto-clears a few seconds after you're already there). Expanded, each mode speaks its own dialect: a rubber-stamped ✓ on the paper ticket, a badge on the orbit icon, a neon tick under the sign.
+
+The widened bar is itself a hover target, split by where you enter: glide in over the **notch** and you get the switcher, as always; glide in over the **widened part beside it** and a status card drops down instead — app icon, name, state, a live spinner per working agent, and a big rubber stamp slammed onto every finished one. The card is pure display: it never steals clicks from whatever is under it.
 
 Two signals, merged per app:
 

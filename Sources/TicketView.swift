@@ -213,8 +213,8 @@ struct TicketView: View {
                         .position(x: TW / 2, y: 160)
                 }
                 if let ws = state.work[i] {
-                    StatusBadge(ws: ws, tint: acc, paper: true, size: 11)
-                        .position(x: TW - 14, y: 16)
+                    StatusBadge(ws: ws, tint: acc, paper: true, size: 12)
+                        .position(x: TW - 15, y: 17)
                 }
                 Line()
                     .stroke(Self.ink.opacity(0.4), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))

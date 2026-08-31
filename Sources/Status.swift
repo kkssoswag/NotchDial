@@ -251,6 +251,32 @@ struct DoneCheck: View {
     }
 }
 
+// A proper rubber stamp: double ring, heavy check, slams down with a twist.
+struct RubberStamp: View {
+    var size: CGFloat = 44
+    var ink: Color = RubberStamp.green
+    static let green = Color(red: 0.24, green: 0.78, blue: 0.42)
+    @State private var slam = false
+    var body: some View {
+        ZStack {
+            Circle().stroke(ink, lineWidth: max(2.0, size * 0.058))
+            Circle().stroke(ink.opacity(0.6), lineWidth: max(0.9, size * 0.026))
+                .padding(size * 0.10)
+            Image(systemName: "checkmark")
+                .font(.system(size: size * 0.44, weight: .black))
+                .foregroundColor(ink)
+        }
+        .frame(width: size, height: size)
+        .rotationEffect(.degrees(slam ? -14 : -2))
+        .scaleEffect(slam ? 1 : 2.4)
+        .opacity(slam ? 0.95 : 0)
+        .onAppear {
+            slam = false
+            withAnimation(.interpolatingSpring(stiffness: 420, damping: 21)) { slam = true }
+        }
+    }
+}
+
 // One badge, three dialects: dark modes get a glowing glyph, paper gets stamped ink.
 struct StatusBadge: View {
     let ws: WorkState
@@ -258,27 +284,13 @@ struct StatusBadge: View {
     var paper = false
     var size: CGFloat = 13
     static let stampInk = Color(red: 0.13, green: 0.50, blue: 0.27)
-    @State private var stamped = false
     var body: some View {
         switch ws {
         case .working:
             WorkSpinner(tint: tint, size: size, lineWidth: paper ? 2.0 : 2.2)
         case .done:
             if paper {
-                ZStack {
-                    Circle().stroke(Self.stampInk, lineWidth: 1.6)
-                        .frame(width: size + 8, height: size + 8)
-                    Image(systemName: "checkmark")
-                        .font(.system(size: size * 0.78, weight: .heavy))
-                        .foregroundColor(Self.stampInk)
-                }
-                .rotationEffect(.degrees(-12))
-                .opacity(stamped ? 0.92 : 0)
-                .scaleEffect(stamped ? 1 : 2.1)
-                .onAppear {
-                    stamped = false
-                    withAnimation(.interpolatingSpring(stiffness: 460, damping: 19)) { stamped = true }
-                }
+                RubberStamp(size: size + 11, ink: Self.stampInk)
             } else {
                 DoneCheck(size: size)
             }
