@@ -293,35 +293,6 @@ struct WorkSpinner: View {
     }
 }
 
-// checkmark slams in with overshoot while a shockwave ring bursts outward
-struct DoneCheck: View {
-    var size: CGFloat = 15
-    static let green = Color(red: 0.30, green: 0.86, blue: 0.40)
-    @State private var pop = false
-    @State private var burst = false
-    var body: some View {
-        ZStack {
-            Circle()
-                .stroke(Self.green, lineWidth: 1.8)
-                .frame(width: size * 1.2, height: size * 1.2)
-                .scaleEffect(burst ? 2.3 : 0.45)
-                .opacity(burst ? 0 : 0.9)
-            Image(systemName: "checkmark")
-                .font(.system(size: size, weight: .black))
-                .foregroundColor(Self.green)
-                .shadow(color: Self.green.opacity(0.9), radius: 5)
-                .scaleEffect(pop ? 1 : 0.15)
-                .opacity(pop ? 1 : 0)
-        }
-        .onAppear {
-            pop = false
-            burst = false
-            withAnimation(.interpolatingSpring(stiffness: 380, damping: 13)) { pop = true }
-            withAnimation(.easeOut(duration: 0.6)) { burst = true }
-        }
-    }
-}
-
 // A proper rubber stamp: double ring, heavy check, slams down with a twist.
 struct RubberStamp: View {
     var size: CGFloat = 44
@@ -348,7 +319,8 @@ struct RubberStamp: View {
     }
 }
 
-// One badge, three dialects: dark modes get a glowing glyph, paper gets stamped ink.
+// One badge, two dialects: working = the app-tinted comet spinner;
+// done = the same rubber stamp everywhere — bright green on dark, ink on paper.
 struct StatusBadge: View {
     let ws: WorkState
     let tint: Color
@@ -360,11 +332,7 @@ struct StatusBadge: View {
         case .working:
             WorkSpinner(tint: tint, size: size, lineWidth: paper ? 2.0 : 2.2)
         case .done:
-            if paper {
-                RubberStamp(size: size + 11, ink: Self.stampInk)
-            } else {
-                DoneCheck(size: size)
-            }
+            RubberStamp(size: size + (paper ? 11 : 6), ink: paper ? Self.stampInk : RubberStamp.green)
         case .idle:
             EmptyView()
         }

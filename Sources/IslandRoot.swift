@@ -52,10 +52,13 @@ struct IslandRoot: View {
             return StatusEntry(t: t, s: s)
         }
     }
-    // how far the collapsed bar grows on EACH side of the notch —
-    // long enough that the bar clearly outgrows the notch and invites a hover
+    // how far the collapsed bar grows on EACH side of the notch. Each agent gets one
+    // pill (icon + its glyph) and the pills are split evenly left/right of the notch,
+    // so the bar stays compact and symmetric instead of stretching for a single app.
     static func statusExtension(count: Int) -> CGFloat {
-        count == 0 ? 0 : CGFloat(count) * 34 + 42
+        guard count > 0 else { return 0 }
+        let perSide = (count + 1) / 2          // 1 app → 1 side, 2 → 1+1, 3 → 2+1
+        return CGFloat(perSide) * 46 + 14
     }
     private var capsuleExt: CGFloat { Self.statusExtension(count: statusList.count) }
 
@@ -111,43 +114,50 @@ struct IslandRoot: View {
         .animation(.interpolatingSpring(stiffness: 320, damping: 25), value: state.showCard)
     }
 
-    // collapsed live-status bar: app icons on the left of the notch, state glyphs on the right.
+    // one agent = one pill: its icon, then its own state glyph — never split apart
+    @ViewBuilder private func statusPill(_ e: StatusEntry, iconS: CGFloat) -> some View {
+        HStack(spacing: 6) {
+            if let img = IconCache.icon(for: e.t) {
+                Image(nsImage: img)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: iconS, height: iconS)
+                    .shadow(color: .black.opacity(0.55), radius: 2, y: 1)
+            }
+            StatusBadge(ws: e.s, tint: e.t.tint, size: iconS * 0.62)
+                .id("cap-\(e.t.id)-\(e.s == .working ? "w" : "d")")
+        }
+        .transition(.asymmetric(
+            insertion: .scale(scale: 0.3).combined(with: .opacity),
+            removal: .scale(scale: 0.4).combined(with: .opacity)))
+    }
+
+    // collapsed live-status bar: one pill per agent, split evenly around the notch.
     // Everything springs out from behind the notch, as if the black bar squeezed it out.
     // On hover the bar grows downward into a small status ledger — one line per agent,
     // rubber-stamped once its task is done. One continuous shape; nothing floats.
     @ViewBuilder private func statusCapsule(width: CGFloat, height: CGFloat, grown: Bool) -> some View {
         let iconS = min(22, state.notchHeight - 9)
+        let perSide = (statusList.count + 1) / 2
+        let left = Array(statusList.prefix(perSide))
+        let right = Array(statusList.dropFirst(perSide))
         VStack(spacing: 0) {
             HStack(spacing: 0) {
-                HStack(spacing: 6) {
-                    ForEach(statusList) { e in
-                        if let img = IconCache.icon(for: e.t) {
-                            Image(nsImage: img)
-                                .resizable()
-                                .interpolation(.high)
-                                .aspectRatio(contentMode: .fit)
-                                .frame(width: iconS, height: iconS)
-                                .shadow(color: .black.opacity(0.55), radius: 2, y: 1)
-                                .transition(.asymmetric(
-                                    insertion: .move(edge: .trailing).combined(with: .scale(scale: 0.35)).combined(with: .opacity),
-                                    removal: .scale(scale: 0.4).combined(with: .opacity)))
-                        }
-                    }
+                // each agent travels as one pill: its icon and its own glyph, side by side
+                HStack(spacing: 14) {
+                    ForEach(left) { e in statusPill(e, iconS: iconS) }
                 }
-                .padding(.leading, 10)
+                .padding(.leading, 12)
                 Spacer(minLength: state.notchWidth)
-                HStack(spacing: 9) {
-                    ForEach(statusList) { e in
-                        StatusBadge(ws: e.s, tint: e.t.tint, size: iconS * 0.72)
-                            .id("cap-\(e.t.id)-\(e.s == .working ? "w" : "d")")
-                            .transition(.asymmetric(
-                                insertion: .move(edge: .leading).combined(with: .scale(scale: 0.35)).combined(with: .opacity),
-                                removal: .scale(scale: 0.4).combined(with: .opacity)))
-                    }
+                HStack(spacing: 14) {
+                    ForEach(right) { e in statusPill(e, iconS: iconS) }
                 }
-                .padding(.trailing, 11)
+                .padding(.trailing, 12)
             }
             .frame(width: width, height: state.notchHeight)
+            // while the ledger is out, the strip's glyph row would just repeat it
+            .opacity(grown ? 0 : 1)
             if grown {
                 // receipt rows: icon + name, state told by the glyph alone — click to jump
                 VStack(spacing: 0) {

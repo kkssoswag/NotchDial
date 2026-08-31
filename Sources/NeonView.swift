@@ -37,7 +37,7 @@ struct NeonView: View {
                         case .working:
                             WorkSpinner(tint: t.tint, size: 10, lineWidth: 1.8)
                         case .done:
-                            DoneCheck(size: 10)
+                            RubberStamp(size: 14)
                         case .idle:
                             Circle()
                                 .fill(t.id == state.centeredIndex ? t.tint : Color(white: 0.16))
