@@ -536,7 +536,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         atick(false, nodes: 90)
         results.append(axm.states[0] == .done ? "PASS 状态·AX收工→出章" : "FAIL 状态·AX收工→出章")
         atick(true, nodes: 90); atick(false, nodes: 90, step: 1)
-        results.append(axm.states[0] == nil ? "PASS 状态·AX短任务不出章" : "FAIL 状态·AX短任务不出章")
+        results.append(axm.states[0] == nil ? "PASS 状态·AX瞬时抖动不出章" : "FAIL 状态·AX瞬时抖动不出章")
+        // a genuinely short turn still earns its stamp — AX is exact, not a guess
+        atick(true, nodes: 90); atick(true, nodes: 90); atick(false, nodes: 90)
+        results.append(axm.states[0] == .done ? "PASS 状态·AX短回合也盖章" : "FAIL 状态·AX短回合也盖章")
         // a stamp must stay on screen long enough to be seen, even if you never left
         let lm = StatusMonitor()
         lm.dirPath = NSTemporaryDirectory() + "nd-linger-selftest-\(ProcessInfo.processInfo.processIdentifier)"

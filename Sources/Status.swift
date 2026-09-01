@@ -21,6 +21,10 @@ final class StatusMonitor {
     var hotNeeded = 6                      // consecutive hot samples to latch working (~9 s)
     var coldNeeded = 4                     // consecutive cold samples to release
     var minWorkForDone: TimeInterval = 8   // shorter bursts end silently, not with a ✓
+    // The 8 s floor above exists to stop the *guessing* signals from stamping every
+    // CPU blip. The Accessibility signal is exact — a turn that really ran deserves
+    // its stamp however short it was, so it gets its own much lower floor.
+    var axMinWork: TimeInterval = 2
     var workingTTL: TimeInterval = 30 * 60 // stale "working" files are ignored (crashed agent)
     var doneTTL: TimeInterval = 12 * 3600
     // How long a finished stamp stays visible when you are ALREADY looking at that
@@ -251,7 +255,7 @@ final class StatusMonitor {
                 }
             } else if axBusy.contains(id) {
                 axBusy.remove(id)
-                if now.timeIntervalSince(axStart[id] ?? now) >= minWorkForDone {
+                if now.timeIntervalSince(axStart[id] ?? now) >= axMinWork {
                     autoDone.insert(id)
                 }
             }
