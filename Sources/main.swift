@@ -976,6 +976,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             collapse()
         }
         glide("在刘海里慢慢滑动（视频里的动作）", ms: 1500)
+
+        // Replayed verbatim from the log of a real failed attempt, 8ms apart as
+        // recorded. This is the gesture; if it does not open, nothing else matters.
+        func replay(_ name: String, _ pts: [(CGFloat, CGFloat)], _ want: Bool) {
+            collapse()
+            var opened = false
+            for (x, y) in pts {
+                warpFast(NSPoint(x: x, y: y)); usleep(8_000); mouseMoved()
+                if state.phase == .expanded { opened = true; break }
+            }
+            let ok = opened == want
+            print("\(ok ? "PASS" : "FAIL") 悬停·\(name)  opened=\(opened) want=\(want)")
+            ok ? (pass += 1) : (fail += 1)
+            collapse()
+        }
+        replay("下拉手势（照抄日志里的真实坐标）",
+               [(808, 980), (804, 978), (798, 974), (790, 970), (780, 966), (764, 959), (743, 953)], true)
+        replay("另一次真实下拉", [(771, 978), (771, 968), (771, 954)], true)
+        // …and the thing a pull must never be confused with: running along the top
+        replay("沿顶边横穿（等高，不下拉）",
+               [(600, 980), (650, 980), (700, 981), (750, 980), (800, 980), (860, 981)], false)
         handApproach("瞄准刘海左边缘", NSPoint(x: n.minX + 3, y: f.maxY - 3))
         handApproach("瞄准刘海右边缘", NSPoint(x: n.maxX - 3, y: f.maxY - 3))
         // …but parking in it still opens, which is the line we are drawing
@@ -1163,6 +1184,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// distinguished by how fast they are going, not by how far they have got.
     /// A menu-bar crossing runs 800–2000 pt/s; a hover glide is a few hundred.
     static var maxHoverSpeed: CGFloat = 600
+    /// The gesture people actually make. A recording plus the log of a real attempt
+    /// says it plainly: the pointer enters at the top of the notch and travels
+    /// *downward* out of it in about 40ms — 978 → 968 → 954 → gone. That is a pull,
+    /// the same one the shape itself suggests, and it was never going to survive a
+    /// rule that waits 220ms for someone to hold still. Waiting is one way in; pulling
+    /// down is the other, and it opens on the spot.
+    ///
+    /// It is also self-limiting in exactly the right way: a menu-bar crossing runs
+    /// along the top at a constant height and never travels down at all.
+    static var pullDown: CGFloat = 10
+    private var zoneEntryY: CGFloat?
     private var zoneSince: Date?
     private var lastPos: NSPoint = .zero
     private var lastPosAt: Date?
@@ -1219,31 +1251,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                     nearLedger: near) {
             case .openSwitcher:
                 let began = zoneSince ?? Date()
-                if zoneSince == nil { zoneSince = began }
+                if zoneSince == nil { zoneSince = began; zoneEntryY = m.y }
                 let held = Date().timeIntervalSince(began)
-                if held >= Self.openDwell && speed < Self.maxHoverSpeed {
-                    zoneSince = nil; expand()
+                let pulled = (zoneEntryY ?? m.y) - m.y          // AppKit y grows upward
+                if pulled >= Self.pullDown {
+                    zoneSince = nil; zoneEntryY = nil; expand()
+                    hoverLog(1, m, "OPEN pull=\(Int(pulled))pt")
+                } else if held >= Self.openDwell && speed < Self.maxHoverSpeed {
+                    zoneSince = nil; zoneEntryY = nil; expand()
                     hoverLog(1, m, "OPEN held=\(Int(held * 1000))ms v=\(Int(speed))")
                 } else {
-                    hoverLog(1, m, "held=\(Int(held * 1000))ms v=\(Int(speed))")
+                    // rising back up re-arms the pull, so a wobble cannot bank credit
+                    if m.y > (zoneEntryY ?? m.y) { zoneEntryY = m.y }
+                    hoverLog(1, m, "held=\(Int(held * 1000))ms v=\(Int(speed)) pull=\(Int(pulled))")
                 }
             case .openLedger:
-                zoneSince = nil
+                zoneSince = nil; zoneEntryY = nil
                 state.cardLatch = state.liveRows   // freeze the rows for as long as you're reading them
                 state.showCard = true
                 panel?.ignoresMouseEvents = true   // still in the top strip: menu bar stays clickable
             case .holdLedger:
-                zoneSince = nil
+                zoneSince = nil; zoneEntryY = nil
                 // in the grown ledger below the strip: rows take clicks
                 let inStrip = m.y > g.windowRect.maxY - state.notchHeight - 2
                 panel?.ignoresMouseEvents = inStrip || !card.contains(m)
             case .dropLedger:
-                zoneSince = nil
+                zoneSince = nil; zoneEntryY = nil
                 state.showCard = false
                 state.cardLatch = []
                 panel?.ignoresMouseEvents = true
             case .nothing:
-                zoneSince = nil
+                zoneSince = nil; zoneEntryY = nil
             }
         case .expanded:
             let island = hoverRectGlobal()
