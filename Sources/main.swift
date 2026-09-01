@@ -613,6 +613,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let vm = StatusMonitor()
         vm.dirPath = NSTemporaryDirectory() + "nd-verdict-selftest-\(ProcessInfo.processInfo.processIdentifier)"
         vm.hbEnabled = false
+        vm.bgSettleDelay = 60       // evidence, not timing — and explicit settles skip the wait
         vm.frontmostBundlePath = { "/nonexistent" }
         var vNow = Date(timeIntervalSince1970: 5_000_000)
         func vtick(_ r: StatusMonitor.AXRead, _ step: TimeInterval = 1) {
@@ -636,6 +637,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         wm.dirPath = NSTemporaryDirectory() + "nd-watchdog-selftest-\(ProcessInfo.processInfo.processIdentifier)"
         wm.hbEnabled = false
         wm.axUnknownGrace = 10
+        wm.bgSettleDelay = 0
         wm.frontmostBundlePath = { "/nonexistent" }
         var wNow = Date(timeIntervalSince1970: 6_000_000)
         func wtick(_ r: StatusMonitor.AXRead, _ step: TimeInterval = 1) {
@@ -678,6 +680,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let mm = StatusMonitor()
         mm.dirPath = NSTemporaryDirectory() + "nd-multi-selftest-\(ProcessInfo.processInfo.processIdentifier)"
         mm.hbEnabled = false
+        mm.bgSettleDelay = 0        // ditto: aggregation, not timing
         mm.frontmostBundlePath = { "/nonexistent" }
         var mNow2 = Date(timeIntervalSince1970: 9_000_000)
         func mtick(_ running: [String], _ settled: [String], _ step: TimeInterval = 1) {
@@ -751,6 +754,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ? "PASS 回合·停止键还没出现不算收工" : "FAIL 回合·停止键还没出现不算收工")
         otick(.init(nodes: 90, running: [], settled: [open], openSession: open, openBusy: false, openChecked: true))
         results.append(om.states[0] == .done ? "PASS 回合·两个都静了才收工" : "FAIL 回合·两个都静了才收工")
+        // A background session has only the sidebar, and the sidebar goes quiet for
+        // the length of every tool call. It gets a minute of grace; the visible
+        // session, which the composer can answer for, gets none.
+        let gm = StatusMonitor()
+        gm.dirPath = NSTemporaryDirectory() + "nd-grace-selftest-\(ProcessInfo.processInfo.processIdentifier)"
+        gm.hbEnabled = false
+        gm.bgSettleDelay = 60
+        gm.frontmostBundlePath = { "/nonexistent" }
+        let bgOnly = "后台会话"
+        var gNow = Date(timeIntervalSince1970: 12_000_000)
+        func gtick(_ running: [String], _ step: TimeInterval = 1) {
+            gNow = gNow.addingTimeInterval(step)
+            // running empty AND not settled: the row is simply not readable this sweep
+            gm.applyAX([0: .init(nodes: 90, running: running)], now: gNow)
+        }
+        gtick([bgOnly]); gtick([bgOnly])
+        gtick([], 30)                       // 30 s into a tool call
+        results.append(gm.states[0] == .working ? "PASS 后台·安静半分钟仍算在跑" : "FAIL 后台·安静半分钟仍算在跑")
+        gtick([bgOnly], 5); gtick([], 40)       // it came back, then went quiet again
+        results.append(gm.states[0] == .working ? "PASS 后台·恢复后重新计时" : "FAIL 后台·恢复后重新计时")
+        gtick([], 70)                       // now genuinely out of sight past the minute
+        results.append(gm.states[0] == .done ? "PASS 后台·失联满一分钟才收工" : "FAIL 后台·失联满一分钟才收工")
+        // but a row that says so itself does not wait at all
+        gm.clearDone(kTargets[0])
+        gtick([bgOnly]); gtick([bgOnly])
+        gNow = gNow.addingTimeInterval(1)
+        gm.applyAX([0: .init(nodes: 90, running: [], settled: [bgOnly])], now: gNow)
+        results.append(gm.states[0] == .done ? "PASS 后台·行明说收工就不等" : "FAIL 后台·行明说收工就不等")
         // a background session the composer cannot speak for still uses the sidebar
         om.clearDone(kTargets[0])
         let bg = "后台会话"

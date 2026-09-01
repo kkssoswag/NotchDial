@@ -333,7 +333,13 @@ enum AXStatus {
             lock.lock(); scopeCache[pid] = nil; lock.unlock()
         }
         lock.lock(); let streak = emptyStreak[pid] ?? 0; lock.unlock()
-        let backoff = min(fullScanEvery * pow(2, Double(min(streak, 4))), 60)
+        // Cap at five minutes, not one. When Chromium has torn its tree down, the
+        // only thing that brings it back is being left alone — measured: all three
+        // apps at windows=0 together, still zero after three minutes of NotchDial
+        // retrying, and back to windows=1 within a couple of minutes of nothing
+        // touching them. Retrying harder is not neutral; it is the thing keeping it
+        // down. Nobody is reading the notch during those minutes anyway.
+        let backoff = min(fullScanEvery * pow(2, Double(min(streak, 7))), 300)
         if let last = last, Date().timeIntervalSince(last) < backoff {
             // Not allowed to walk yet, and nothing cached: say so honestly rather
             // than reporting an idle we did not actually observe.

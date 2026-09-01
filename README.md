@@ -52,19 +52,32 @@ So NotchDial reads the truth instead, in this order:
    same minute: six state changes in 30 s before, one in 90 s after.
 
    `AXWebArea`'s title (`<session> - Claude`) says which session the control
-   belongs to, so the composer speaks only for the session on screen. Background
-   sessions still use the sidebar label — a background session inside a tool call
-   is the one case nothing local can currently see.
+   belongs to, so the composer speaks only for the session on screen. The two
+   signals are taken as a **union**, not a hierarchy: measured over 796 sweeps they
+   agree 99.6% of the time, and where they disagree each covers the other's blind
+   spot — the sidebar flips the instant you hit send but the interrupt control takes
+   a beat to render; the interrupt control spans a whole turn but only exists for
+   the visible session. Either one alone was wrong in a way the other is right
+   about, so it takes both being quiet to call a turn finished.
+
+   Losing sight of a session is not the same as watching it stop. A row that says
+   `Mark as unread <name>` settles immediately, and so does the visible session when
+   its interrupt control goes; but a session that simply becomes unreadable — a
+   partial tree, a re-rendered row, a background agent whose row we lose — is given
+   a minute before NotchDial will call it finished.
 
    Two practical notes, both learned the hard way. Chromium keeps its web
    accessibility tree off until an assistive client opts in (`AXManualAccessibility`),
    and it switches the tree back **off** again when it decides nobody is listening —
-   so the opt-in has to be re-asserted, with backoff, or the signal dies silently
-   and never returns. And walking that tree is not free: a full walk every second
-   made all three Electron apps stop reporting their windows at all. NotchDial
-   locates the rows and the composer once, then re-reads those elements for a
-   couple of IPC calls each (measured: 6 nodes, ~1 ms per sweep), and re-walks only
-   to discover something new.
+   so the opt-in has to be re-asserted or the signal dies silently and never returns.
+   And walking that tree is emphatically not free: a full walk every second made all
+   three Electron apps report **zero windows** — confirmed against System Events, so
+   it is the apps and not this client — and they stayed that way while anything kept
+   retrying, coming back a couple of minutes after being left alone. Retrying harder
+   is what keeps it down, so the re-assert backs off to five minutes. NotchDial
+   locates the rows and the composer once, then re-reads those elements for a couple
+   of IPC calls each (measured: 6 nodes, ~1 ms per sweep), and re-walks only to
+   discover something new.
 
    Needs a one-time grant: **menu bar → 精确状态**, or System Settings › Privacy &
    Security › Accessibility › NotchDial. See **Keeping the permission** below if you

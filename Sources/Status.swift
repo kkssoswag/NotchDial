@@ -111,12 +111,13 @@ final class StatusMonitor {
         guard !r.running.isEmpty || !r.settled.isEmpty || (r.openChecked && r.openSession != nil) else { return }
         var st = sessState[id] ?? [:]
         var sn = sessSince[id] ?? [:]
-        var running = Set(r.running)
+        // Same settle rule as the app-level verdict, so a row cannot say "done"
+        // while the aggregate still says "working".
+        let running = axLive[id] ?? []
         var settledNames = r.settled
-        if let open = r.openSession, r.openChecked, r.openBusy {
-            running.insert(open); settledNames.removeAll { $0 == open }
-        }
         settledNames.removeAll { running.contains($0) }
+        if let open = r.openSession, r.openChecked, !r.openBusy, !running.contains(open),
+           !settledNames.contains(open) { settledNames.append(open) }
         for n in running where st[n] != .working {
             st[n] = .working; sn[n] = now
         }
@@ -166,6 +167,48 @@ final class StatusMonitor {
 
     /// What one sweep is allowed to conclude.
     enum AXVerdict { case working, finished, unknown }
+
+    /// How long a session may simply *not be visible* before we believe it finished.
+    /// This is not a debounce on a signal that said "stopped" — a row explicitly
+    /// reading "Mark as unread <name>" settles immediately, and the visible session
+    /// settles the moment the interrupt control goes too. This covers the case where
+    /// the evidence goes missing rather than negative: a partial tree, a re-rendered
+    /// row, an app too busy to answer, a background agent whose row we lose while it
+    /// works. Silence is not the same as an answer, and for a minute we decline to
+    /// treat it as one.
+    var bgSettleDelay: TimeInterval = 60
+    private var quietSince: [Int: [String: Date]] = [:]
+
+    /// The sessions this app should still be considered running, after the settle
+    /// rule. Called once per sweep; it owns `axLive`.
+    private func liveNames(_ id: Int, _ r: AXRead, now: Date) -> Set<String> {
+        var live = axLive[id] ?? []
+        var q = quietSince[id] ?? [:]
+        let running = Set(r.running)
+        let openLive: String? = (r.openChecked && r.openBusy) ? r.openSession : nil
+        live.formUnion(running)
+        if let o = openLive { live.insert(o) }
+        let settled = Set(r.settled)
+        for n in live {
+            if running.contains(n) || n == openLive { q[n] = nil; continue }
+            // Its own row saying "Mark as unread <name>" is positive evidence that it
+            // stopped. The grace below is for LOSING SIGHT of a session — a partial
+            // tree, a re-rendered row, an app too busy to answer — not for a session
+            // that told us plainly.
+            if settled.contains(n) { live.remove(n); q[n] = nil; continue }
+            // The composer speaks for the session on screen, so when both it and the
+            // sidebar are quiet there is nothing left to wait for.
+            if r.openChecked, n == r.openSession {
+                live.remove(n); q[n] = nil; continue
+            }
+            let since = q[n] ?? now
+            q[n] = since
+            if now.timeIntervalSince(since) >= bgSettleDelay { live.remove(n); q[n] = nil }
+        }
+        quietSince[id] = q
+        axLive[id] = live
+        return live
+    }
 
     private(set) var states: [Int: WorkState] = [:]   // only non-idle entries
     /// When each current state began — the ledger's whole reason to exist is telling
@@ -275,7 +318,7 @@ final class StatusMonitor {
         hbPrevSize = [:]; hbLastEvent = [:]; hbPrevEvent = [:]; hbActive = []; hbStart = [:]
         axBusy = []; axUsable = []; axStart = [:]; axOwed = []
         axLive = [:]; axUnknownSince = [:]; since = [:]
-        sessState = [:]; sessSince = [:]; sessions = [:]; onSessions?([:])
+        sessState = [:]; sessSince = [:]; sessions = [:]; quietSince = [:]; onSessions?([:])
         axGeneration &+= 1; axInFlight = false; axSweepStarted = nil
         if let o = activateObserver { NSWorkspace.shared.notificationCenter.removeObserver(o) }
         activateObserver = nil
@@ -382,7 +425,7 @@ final class StatusMonitor {
     /// something it had no way to still know.
     func forgetAX(_ id: Int) {
         axUsable.remove(id); axBusy.remove(id); axOwed.remove(id)
-        axLive[id] = nil; axStart[id] = nil; axUnknownSince[id] = nil
+        axLive[id] = nil; axStart[id] = nil; axUnknownSince[id] = nil; quietSince[id] = nil
         sessState[id] = nil; sessSince[id] = nil
         rebuildSessions()
     }
@@ -463,7 +506,7 @@ final class StatusMonitor {
 
     /// Weigh one sweep's evidence for one app. The whole point is the third answer:
     /// a sweep that simply failed to find the row must not be allowed to say "idle".
-    func verdict(_ id: Int, _ r: AXRead) -> AXVerdict {
+    func verdict(_ id: Int, _ r: AXRead, now: Date) -> AXVerdict {
         // The interrupt control is the only turn-level thing in the tree: it exists
         // for exactly as long as the turn does, because a turn is by definition
         // interruptible. The sidebar's "Running <name>" only tracks token emission,
@@ -475,20 +518,12 @@ final class StatusMonitor {
         // the instant you hit send but goes quiet during a tool call; the interrupt
         // control spans the whole turn but takes a beat to appear. Letting either one
         // veto the other produced a false ✓ three seconds into a turn.
-        var live = Set(r.running)
-        if let open = r.openSession, r.openChecked, r.openBusy { live.insert(open) }
-        if !live.isEmpty {
-            axLive[id] = live
-            return .working
-        }
-        if let live = axLive[id], !live.isEmpty {
-            // We know exactly which rows to look for. Only their *finished* labels
-            // settle the question; anything else is a tree we failed to read.
-            let settled = Set(r.settled)
-            let stillOut = live.subtracting(settled)
-            if stillOut.isEmpty { axLive[id] = []; return .finished }
-            axLive[id] = stillOut
-            return .unknown
+        let evidence = !r.running.isEmpty || !r.settled.isEmpty || (r.openChecked && r.openSession != nil)
+        let tracking = !(axLive[id]?.isEmpty ?? true)
+        // A tree we failed to read is not evidence that anything stopped.
+        if !evidence && !r.complete && tracking { return .unknown }
+        if evidence || tracking {
+            return liveNames(id, r, now: now).isEmpty ? .finished : .working
         }
         // Apps with no session vocabulary (Cursor, Codex): a stop control means
         // working, and only a walk that actually finished may mean idle.
@@ -504,9 +539,10 @@ final class StatusMonitor {
             if r.nodes >= 20 || !r.running.isEmpty || !r.settled.isEmpty { axUsable.insert(id) }
             else if r.complete { axUsable.remove(id) }
             guard axUsable.contains(id) else { continue }
-            applySessions(id, r, now: now)
             let busy: Bool
-            switch verdict(id, r) {
+            let v = verdict(id, r, now: now)
+            applySessions(id, r, now: now)
+            switch v {
             case .working:
                 busy = true
                 axUnknownSince[id] = nil
