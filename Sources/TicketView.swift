@@ -138,12 +138,20 @@ struct TicketView: View {
             ForEach(0..<3, id: \.self) { i in
                 ticket(i)
             }
-            UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: 13,
-                                   bottomTrailingRadius: 13, topTrailingRadius: 0, style: .continuous)
+            // The dispenser belongs to the notch, not to the ticket composition, so it
+            // must come out the same size whatever the switcher is scaled to —
+            // otherwise the slot the paper feeds from ends up narrower than the notch
+            // it is supposed to be part of. Divided by the scale here, multiplied by it
+            // on the way out: exact, and no nested transform.
+            let cs = IslandState.uiScale
+            let capW = (state.notchWidth + 14) / cs
+            let capH = (state.notchHeight + 10) / cs
+            UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: 13 / cs,
+                                   bottomTrailingRadius: 13 / cs, topTrailingRadius: 0, style: .continuous)
                 .fill(Color.black)
-                .frame(width: state.notchWidth + 14, height: state.notchHeight + 10)
-                .shadow(color: .black.opacity(0.30), radius: 6, y: 3)
-                .position(x: W / 2, y: (state.notchHeight + 10) / 2)
+                .frame(width: capW, height: capH)
+                .shadow(color: .black.opacity(0.30), radius: 6 / cs, y: 3 / cs)
+                .position(x: W / 2, y: capH / 2)
                 .zIndex(10)
                 .allowsHitTesting(false)
         }

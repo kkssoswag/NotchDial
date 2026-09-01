@@ -36,6 +36,7 @@ final class StatusMonitor {
     var dirPath = (NSHomeDirectory() as NSString).appendingPathComponent(".notchdial/status")
     var frontmostBundlePath: () -> String? = { NSWorkspace.shared.frontmostApplication?.bundleURL?.path }
     var onChange: (([Int: WorkState]) -> Void)?
+    var onTimes: (([Int: Date]) -> Void)?
 
     // MARK: live heartbeat (thin-client sync)
     // Cloud-side agents barely touch local CPU — but their desktop apps commit the
@@ -106,6 +107,9 @@ final class StatusMonitor {
     enum AXVerdict { case working, finished, unknown }
 
     private(set) var states: [Int: WorkState] = [:]   // only non-idle entries
+    /// When each current state began — the ledger's whole reason to exist is telling
+    /// you how long a thing has been running, and that needs a start, not just a flag.
+    private(set) var since: [Int: Date] = [:]
     private var timer: Timer?
     private var prevCPU: [Int: Double] = [:]
     private var prevTime: Date?
@@ -429,8 +433,11 @@ final class StatusMonitor {
         }
         if out != states {
             log("PUBLISH \(out.map { "\($0.key)=\($0.value)" }.sorted())")
+            for (id, v) in out where states[id] != v { since[id] = now }
+            for id in since.keys where out[id] == nil { since[id] = nil }
             states = out
             onChange?(states)
+            onTimes?(since)
         }
     }
 
@@ -498,6 +505,29 @@ struct WorkSpinner: View {
 }
 
 // A proper rubber stamp: double ring, heavy check, slams down with a twist.
+/// How long this agent has been in its current state. Tabular figures so the digits
+/// don't jitter as they tick, and only the text is inside the TimelineView — the icons
+/// beside it stay out of the redraw, per the invariant that keeps this app cheap.
+struct ElapsedLabel: View {
+    var since: Date?
+    var running: Bool
+    static func text(_ d: TimeInterval) -> String {
+        let s = max(0, Int(d))
+        if s < 60 { return "\(s)s" }
+        if s < 3600 { return "\(s / 60)m \(s % 60)s" }
+        return "\(s / 3600)h \((s % 3600) / 60)m"
+    }
+    var body: some View {
+        if let since {
+            TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                Text(Self.text(ctx.date.timeIntervalSince(since)))
+                    .font(.system(size: 10.5, weight: .medium).monospacedDigit())
+                    .foregroundColor(.white.opacity(running ? 0.5 : 0.32))
+            }
+        }
+    }
+}
+
 struct RubberStamp: View {
     var size: CGFloat = 44
     var ink: Color = RubberStamp.green
@@ -514,7 +544,10 @@ struct RubberStamp: View {
         }
         .frame(width: size, height: size)
         .rotationEffect(.degrees(slam ? -14 : -2))
-        .scaleEffect(slam ? 1 : 2.4)
+        // 2.4x overflowed every container this lives in: a 26pt stamp opened at 62pt,
+        // painting over the neighbouring rows and, in the unclipped collapsed strip,
+        // flashing a green ring onto the wallpaper. 1.5 still lands like a stamp.
+        .scaleEffect(slam ? 1 : 1.5)
         .opacity(slam ? 0.95 : 0)
         .onAppear {
             slam = false

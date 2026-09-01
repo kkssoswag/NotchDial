@@ -47,9 +47,19 @@ struct IslandRoot: View {
         var id: Int { t.id }
     }
     private var statusList: [StatusEntry] {
-        kTargets.compactMap { t in
+        let live = kTargets.compactMap { t -> StatusEntry? in
             guard let s = state.work[t.id], s != .idle else { return nil }
             return StatusEntry(t: t, s: s)
+        }
+        guard state.showCard, !state.cardLatch.isEmpty else { return live }
+        // While you are reading the ledger, its rows hold still. An agent finishing
+        // would otherwise delete a row from under the cursor and shrink the panel out
+        // from beneath your pointer; a second agent starting would insert one *above*
+        // the row you were about to click. Each row's glyph still updates live — only
+        // the set and the order are frozen, and only until you leave.
+        let byId = Dictionary(uniqueKeysWithValues: live.map { ($0.id, $0) })
+        return state.cardLatch.compactMap { id in
+            byId[id] ?? kTargets.first { $0.id == id }.map { StatusEntry(t: $0, s: .done) }
         }
     }
     // how far the collapsed bar grows on EACH side of the notch. Icons fan out as an
@@ -63,18 +73,27 @@ struct IslandRoot: View {
     private var capsuleExt: CGFloat { Self.statusExtension(count: statusList.count) }
 
     // extra height when the bar grows into its status ledger (hover on the widened part)
+    static let rowH: CGFloat = 38
     static func statusGrowth(rows: Int) -> CGFloat {
-        rows == 0 ? 0 : CGFloat(rows) * 34 + CGFloat(rows - 1) + 10
+        rows == 0 ? 0 : CGFloat(rows) * rowH + CGFloat(rows - 1) + 8
+    }
+
+    /// The concave lips the bar melts into the screen with. They are the widest part
+    /// of the drawn shape, so the hover math has to know about them too — aiming at
+    /// the visible edge and having the thing retract is the worst kind of lie a UI
+    /// can tell.
+    static func flare(ext: CGFloat, grown: Bool, open: Bool) -> CGFloat {
+        (!open && ext > 0) ? (grown ? 14 : 10) : 0
     }
 
     private var island: some View {
         let ext = isOpen ? 0 : capsuleExt
         let grown = !isOpen && state.showCard && !statusList.isEmpty
         let growH = grown ? Self.statusGrowth(rows: statusList.count) : 0
-        let flare: CGFloat = (!isOpen && ext > 0) ? (grown ? 14 : 10) : 0
+        let flare: CGFloat = Self.flare(ext: ext, grown: grown, open: isOpen)
         let barW = state.notchWidth + 2 * ext
         let sz = isOpen ? state.openSize() : CGSize(width: barW + 2 * flare, height: state.notchHeight + growH)
-        let r: CGFloat = isOpen ? 34 : (grown ? 19 : 10)
+        let r: CGFloat = isOpen ? (34 * IslandState.uiScale).rounded() : (grown ? 19 : 10)
         let shape = UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: r,
                                            bottomTrailingRadius: r, topTrailingRadius: 0, style: .continuous)
         return ZStack(alignment: .top) {
@@ -106,7 +125,7 @@ struct IslandRoot: View {
         .frame(width: sz.width, height: sz.height)
         .compositingGroup()
         .shadow(color: .black.opacity(isOpen ? (state.mode == 1 ? 0.55 : 0) : (grown ? 0.38 : 0)),
-                radius: isOpen ? 22 : 14, y: isOpen ? 9 : 6)
+                radius: isOpen ? 22 * IslandState.uiScale : 14, y: isOpen ? 9 * IslandState.uiScale : 6)
         .animation(.interpolatingSpring(stiffness: 300, damping: 24), value: isOpen)
         .animation(.interpolatingSpring(stiffness: 280, damping: 25), value: state.mode)
         .animation(.interpolatingSpring(stiffness: 330, damping: 20), value: capsuleExt)
@@ -177,7 +196,7 @@ struct IslandRoot: View {
                 // receipt rows: icon + name, state told by the glyph alone — click to jump
                 VStack(spacing: 0) {
                     ForEach(Array(statusList.enumerated()), id: \.element.id) { idx, e in
-                        HStack(spacing: 9) {
+                        HStack(spacing: 10) {
                             if let img = IconCache.icon(for: e.t) {
                                 Image(nsImage: img)
                                     .resizable()
@@ -185,23 +204,33 @@ struct IslandRoot: View {
                                     .aspectRatio(contentMode: .fit)
                                     .frame(width: 20, height: 20)
                             }
-                            Text(e.t.name)
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundColor(.white.opacity(0.94))
-                            Spacer(minLength: 24)
+                            // Name over state: the gap in the middle of this row was
+                            // half its width and said nothing. How long it has been
+                            // running is the one thing you open a ledger to find out.
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(e.t.name)
+                                    .font(.system(size: 12.5, weight: .semibold))
+                                    .foregroundColor(.white.opacity(0.95))
+                                Text(e.s == .working ? "working" : "done")
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundColor(e.s == .working ? e.t.tint.opacity(0.85) : .white.opacity(0.42))
+                            }
+                            Spacer(minLength: 8)
+                            ElapsedLabel(since: state.workSince[e.id], running: e.s == .working)
                             if e.s == .working {
                                 WorkSpinner(tint: e.t.tint, size: 15, lineWidth: 2.2)
                             } else {
-                                RubberStamp(size: 26)
+                                RubberStamp(size: 24)
                             }
                         }
-                        .padding(.horizontal, 14)
-                        .frame(height: 34)
+                        .padding(.horizontal, 12)
+                        .frame(height: Self.rowH)
                         .background(
                             RoundedRectangle(cornerRadius: 9, style: .continuous)
                                 .fill(Color.white.opacity(hoverRow == e.id ? 0.08 : 0))
                         )
                         .contentShape(Rectangle())
+                        .animation(.easeOut(duration: 0.12), value: hoverRow)
                         .onTapGesture { onCardTap(e.t) }
                         .onHover { h in
                             if h { hoverRow = e.id } else if hoverRow == e.id { hoverRow = -1 }
@@ -210,7 +239,7 @@ struct IslandRoot: View {
                             Line()
                                 .stroke(Color.white.opacity(0.15), style: StrokeStyle(lineWidth: 1, dash: [3, 4]))
                                 .frame(height: 1)
-                                .padding(.horizontal, 22)
+                                .padding(.horizontal, 12)
                         }
                     }
                 }
@@ -223,12 +252,23 @@ struct IslandRoot: View {
     }
 
     @ViewBuilder private var content: some View {
-        if state.mode == 0 {
-            OrbitView(state: state, onLaunch: onLaunch, onTap: onTapItem)
-        } else if state.mode == 2 {
-            TicketView(state: state, onLaunch: onLaunch)
-        } else {
-            NeonView(state: state, onLaunch: onLaunch)
+        // Scaled here, at the one place all three modes pass through, so each mode's
+        // own layout math stays exactly as it was tuned. Anchored to the top because
+        // that edge is pinned to the screen — the island grows downward, so that is
+        // the edge the eye reads as fixed.
+        Group {
+            if state.mode == 0 {
+                OrbitView(state: state, onLaunch: onLaunch, onTap: onTapItem)
+            } else if state.mode == 2 {
+                TicketView(state: state, onLaunch: onLaunch)
+            } else {
+                NeonView(state: state, onLaunch: onLaunch)
+            }
         }
+        // Lay out at the box the mode was composed in, THEN shrink. Without the frame
+        // a mode that fills what it is offered (Neon) receives the already-scaled size
+        // and shrinks twice, ending up adrift inside its own card.
+        .frame(width: state.baseSize().width, height: state.baseSize().height, alignment: .top)
+        .scaleEffect(IslandState.uiScale, anchor: .top)
     }
 }

@@ -37,6 +37,12 @@ final class IslandState: ObservableObject {
     @Published var runningIDs: Set<Int> = []
     @Published var work: [Int: WorkState] = [:]   // agent status: only non-idle entries
     @Published var showCard = false               // status card, revealed by hovering the widened bar
+    /// Row order frozen while the ledger is open, so nothing moves under the cursor.
+    @Published var cardLatch: [Int] = []
+    /// When each agent entered its current state, for the ledger's elapsed counter.
+    @Published var workSince: [Int: Date] = [:]
+    /// Rows currently worth showing, in slot order.
+    var liveRows: [Int] { kTargets.compactMap { work[$0.id] != nil && work[$0.id] != .idle ? $0.id : nil } }
 
     var centeredIndex: Int {
         let n = kTargets.count
@@ -45,10 +51,24 @@ final class IslandState: ObservableObject {
     }
     var selectedTarget: AppTarget { kTargets[centeredIndex] }
 
-    func openSize() -> CGSize {
+    /// One knob for how large the switcher draws. The three modes were tuned against
+    /// each other, so this scales the whole composition rather than any single number:
+    /// their internal proportions survive untouched, the island just sits lighter on
+    /// the screen. Everything that hit-tests the island multiplies by this too.
+    static let uiScale: CGFloat = 0.85
+
+    /// The box each mode was composed inside. Modes lay out at these numbers and are
+    /// only *rendered* smaller, so a mode that fills the space it is offered (Neon)
+    /// doesn't get shrunk twice.
+    func baseSize() -> CGSize {
         if mode == 0 { return CGSize(width: 620, height: 196) }
         if mode == 2 { return CGSize(width: 470, height: 285) }
         return CGSize(width: 470, height: 180)
+    }
+
+    func openSize() -> CGSize {
+        let b = baseSize(), s = IslandState.uiScale
+        return CGSize(width: (b.width * s).rounded(), height: (b.height * s).rounded())
     }
 }
 
@@ -135,6 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildPanel()
         setupStatusItem()
         statusMon.onChange = { [weak self] st in self?.state.work = st }
+        statusMon.onTimes = { [weak self] ts in self?.state.workSince = ts }
         if UserDefaults.standard.bool(forKey: "statusEnabled") { statusMon.start() }
         NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved]) { [weak self] _ in self?.mouseMoved() }
         NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved]) { [weak self] e in self?.mouseMoved(); return e }
@@ -374,11 +395,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// One step = one duration, whoever asked for it. Each mode has its own because
+    /// each mode's motion is a different physical idea: a planet crossing space, paper
+    /// feeding, a sign relighting.
+    static func stepDuration(_ mode: Int) -> Double { mode == 0 ? 0.85 : (mode == 2 ? 0.4 : 0.18) }
+
     func step(_ dir: Double) {
         NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .default)
         let target = state.rotation.rounded() + dir
         if instantSteps { state.rotation = target }
-        else { animateRotation(to: target, duration: state.mode == 0 ? 0.85 : (state.mode == 2 ? 0.4 : 0.18)) }
+        else { animateRotation(to: target, duration: Self.stepDuration(state.mode)) }
         UserDefaults.standard.set(wrapIndex(target), forKey: "lastIndex")
     }
 
@@ -430,12 +456,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 results.append("\(ok ? "PASS" : "FAIL") 命中区·\(name)")
             }
             state.mode = 2
-            let spacing = max(70, (state.notchWidth - 60) / 2)
+            let s = IslandState.uiScale
+            let spacing = max(70, (state.notchWidth - 60) / 2) * s
             chk("菜单栏穿透", NSPoint(x: cx + 200, y: top - 10), false)
             chk("票带可点", NSPoint(x: cx, y: top - 150), true)
             chk("侧票带可点", NSPoint(x: cx + spacing, y: top - 150), true)
-            chk("票缝穿透", NSPoint(x: cx + spacing / 2, y: top - 150), spacing / 2 <= 37)
+            chk("票缝穿透", NSPoint(x: cx + spacing / 2, y: top - 150), spacing / 2 <= 37 * s)
             chk("岛下方穿透", NSPoint(x: cx, y: top - 330), false)
+            // entry point locks the mode — the shape must not change under a moving cursor
+            func hi(_ open: Bool, _ zone: Int, _ near: Bool) -> AppDelegate.HoverIntent {
+                AppDelegate.hoverIntent(ledgerOpen: open, zone: zone, nearLedger: near)
+            }
+            results.append(hi(true, 1, true) == .holdLedger
+                ? "PASS 入口锁·开着账单划过刘海不切换" : "FAIL 入口锁·开着账单划过刘海不切换")
+            results.append(hi(false, 1, false) == .openSwitcher
+                ? "PASS 入口锁·刘海入口开切换器" : "FAIL 入口锁·刘海入口开切换器")
+            results.append(hi(false, 2, false) == .openLedger
+                ? "PASS 入口锁·延长区入口开账单" : "FAIL 入口锁·延长区入口开账单")
+            results.append(hi(true, 0, false) == .dropLedger
+                ? "PASS 入口锁·离开轮廓即收" : "FAIL 入口锁·离开轮廓即收")
             state.mode = 0
             chk("星轨主体可点", NSPoint(x: cx, y: top - 120), true)
             chk("星轨侧翼穿透", NSPoint(x: cx + 340, y: top - 120), false)
@@ -746,9 +785,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if g.notchRect.insetBy(dx: -8, dy: 0).contains(m) { return 1 }
         let ext = IslandRoot.statusExtension(count: extCount)
         guard ext > 0 else { return 0 }
-        let cap = NSRect(x: g.windowRect.midX - state.notchWidth / 2 - ext,
+        let fl = IslandRoot.flare(ext: ext, grown: state.showCard, open: false)
+        let cap = NSRect(x: g.windowRect.midX - state.notchWidth / 2 - ext - fl,
                          y: g.windowRect.maxY - state.notchHeight,
-                         width: state.notchWidth + 2 * ext,
+                         width: state.notchWidth + 2 * (ext + fl),
                          height: state.notchHeight)
         return cap.contains(m) ? 2 : 0
     }
@@ -756,13 +796,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // the grown bar's global rect — the hover keep-alive region while the ledger is out
     func statusCardRect() -> NSRect {
         guard let g = geo else { return .zero }
-        let n = state.work.count
+        let n = state.cardLatch.isEmpty ? state.liveRows.count : state.cardLatch.count
         let ext = IslandRoot.statusExtension(count: n)
+        let fl = IslandRoot.flare(ext: ext, grown: true, open: false)
         let h = state.notchHeight + IslandRoot.statusGrowth(rows: n)
-        return NSRect(x: g.windowRect.midX - state.notchWidth / 2 - ext,
+        return NSRect(x: g.windowRect.midX - state.notchWidth / 2 - ext - fl,
                       y: g.windowRect.maxY - h,
-                      width: state.notchWidth + 2 * ext,
+                      width: state.notchWidth + 2 * (ext + fl),
                       height: h)
+    }
+
+    /// How far past its own outline the island stays awake. This used to be 28pt,
+    /// which is most of a fingertip — you could leave the shape entirely and it would
+    /// still be sitting there. Small enough that leaving *looks* like leaving, big
+    /// enough to survive the pixel of overshoot at the end of a fast move.
+    static let hoverSlack: CGFloat = 8
+
+    /// What a pointer position means, given what is already open.
+    enum HoverIntent { case nothing, openSwitcher, openLedger, holdLedger, dropLedger }
+
+    /// Entry point locks the mode. Pure, so the rule can be pinned in --selftest
+    /// instead of living only inside a mouse handler nobody can test.
+    static func hoverIntent(ledgerOpen: Bool, zone: Int, nearLedger: Bool) -> HoverIntent {
+        if ledgerOpen { return nearLedger ? .holdLedger : .dropLedger }
+        if zone == 1 { return .openSwitcher }
+        if zone == 2 { return .openLedger }
+        return .nothing
     }
 
     func mouseMoved() {
@@ -770,30 +829,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let m = NSEvent.mouseLocation
         switch state.phase {
         case .collapsed:
-            switch collapsedZone(m, extCount: state.work.count) {
-            case 1:
-                state.showCard = false
+            // Where you came in decides what you get, and it keeps deciding until you
+            // leave. Sliding from the ledger across the notch used to swap you into the
+            // switcher mid-gesture — the shape changing under a moving cursor, which is
+            // the opposite of the calm this thing is supposed to have.
+            let card = statusCardRect()
+            let near = card.insetBy(dx: -Self.hoverSlack, dy: -Self.hoverSlack).contains(m)
+            switch Self.hoverIntent(ledgerOpen: state.showCard,
+                                    zone: collapsedZone(m, extCount: state.cardLatch.isEmpty ? state.liveRows.count : state.cardLatch.count),
+                                    nearLedger: near) {
+            case .openSwitcher:
                 expand()
-            case 2:
-                if !state.showCard { state.showCard = true }
+            case .openLedger:
+                state.cardLatch = state.liveRows   // freeze the rows for as long as you're reading them
+                state.showCard = true
                 panel?.ignoresMouseEvents = true   // still in the top strip: menu bar stays clickable
-            default:
-                if state.showCard {
-                    let card = statusCardRect()
-                    if card.insetBy(dx: -26, dy: -26).contains(m) {
-                        // in the grown ledger below the strip: rows take clicks
-                        let inStrip = m.y > g.windowRect.maxY - state.notchHeight - 2
-                        panel?.ignoresMouseEvents = inStrip || !card.contains(m)
-                    } else {
-                        state.showCard = false
-                        panel?.ignoresMouseEvents = true
-                    }
-                }
+            case .holdLedger:
+                // in the grown ledger below the strip: rows take clicks
+                let inStrip = m.y > g.windowRect.maxY - state.notchHeight - 2
+                panel?.ignoresMouseEvents = inStrip || !card.contains(m)
+            case .dropLedger:
+                state.showCard = false
+                state.cardLatch = []
+                panel?.ignoresMouseEvents = true
+            case .nothing:
+                break
             }
         case .expanded:
-            let island = islandRectGlobal()
-            let nearNotch = g.notchRect.insetBy(dx: -8, dy: 0).contains(m)
-            let inside = island.insetBy(dx: -28, dy: -28).contains(m) || nearNotch
+            let island = hoverRectGlobal()
+            let nearNotch = g.notchRect.insetBy(dx: -4, dy: 0).contains(m)
+            let inside = island.insetBy(dx: -Self.hoverSlack, dy: -Self.hoverSlack).contains(m) || nearNotch
             if !inside && !pinned { collapse() }
             else { panel?.ignoresMouseEvents = !clickableRegionContains(m) }
         case .launching:
@@ -801,11 +866,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// TicketView.LEN — how far the paper feeds out of the slot.
+    static let ticketLength: CGFloat = 236
+
     func islandRectGlobal() -> NSRect {
         guard let g = geo else { return .zero }
         let w = g.windowRect
         let s = state.openSize()
         return NSRect(x: w.midX - s.width / 2, y: w.maxY - s.height, width: s.width, height: s.height)
+    }
+
+    /// What the island actually *looks* like, for deciding when the pointer has left.
+    /// In ticket mode the drawn thing is three narrow strips, not the 400pt box they
+    /// hang in — keeping the island alive across a hundred points of bare desktop on
+    /// either side is the same "why is this still open" complaint, just wider.
+    func hoverRectGlobal() -> NSRect {
+        let r = islandRectGlobal()
+        guard state.mode == 2, let g = geo else { return r }
+        let s = IslandState.uiScale
+        let spacing = max(70, (state.notchWidth - 60) / 2) * s
+        let halfW = spacing + 37 * s
+        let yTop = g.windowRect.maxY - (state.notchHeight - 4) * s
+        return NSRect(x: r.midX - halfW, y: yTop - Self.ticketLength * s,
+                      width: 2 * halfW, height: Self.ticketLength * s + (state.notchHeight - 4) * s)
     }
 
     // The only places allowed to swallow a click. Everything else — the menu-bar strip,
@@ -816,11 +899,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // the top strip (menu bar / notch height) never takes clicks
         if m.y > g.windowRect.maxY - state.notchHeight - 2 { return false }
         if state.mode == 2 {
-            // ticket mode: only the three paper strips are clickable
-            let spacing = max(70, (state.notchWidth - 60) / 2)
-            let yTop = g.windowRect.maxY - (state.notchHeight - 4)
-            guard m.y <= yTop && m.y >= yTop - 244 else { return false }
-            for i in 0..<3 where abs(m.x - (island.midX + CGFloat(i - 1) * spacing)) <= 37 { return true }
+            // ticket mode: only the three paper strips are clickable. The strips are
+            // drawn through the island's scale, so their hit boxes travel with it.
+            let s = IslandState.uiScale
+            let spacing = max(70, (state.notchWidth - 60) / 2) * s
+            // Both ends of the band live inside the scaled composition, so both scale.
+            // Leaving yTop unscaled left the top of every ticket dead and swallowed
+            // clicks in the empty strip below it.
+            let yTop = g.windowRect.maxY - (state.notchHeight - 4) * s
+            guard m.y <= yTop && m.y >= yTop - Self.ticketLength * s else { return false }
+            for i in 0..<3 where abs(m.x - (island.midX + CGFloat(i - 1) * spacing)) <= 37 * s { return true }
             return false
         }
         // orbit / neon: the island body is the scroll + click surface
@@ -830,6 +918,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func expand() {
         state.phase = .expanded
         state.showCard = false
+        state.cardLatch = []
         panel?.ignoresMouseEvents = false
         panel?.orderFrontRegardless()
         refreshRunning(force: true)
@@ -838,6 +927,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func collapse() {
         state.phase = .collapsed
         state.showCard = false
+        state.cardLatch = []
         panel?.ignoresMouseEvents = true
         gestureAcc = 0
         stepsInGesture = 0
@@ -849,7 +939,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if d > n / 2 { d -= n }
         if d < -n / 2 { d += n }
         let target = (state.rotation + d).rounded()
-        animateRotation(to: target, duration: 0.85)
+        // Same visual change as a swipe, so the same duration. Hardcoding 0.85 here
+        // made a click in Neon take 4.7x longer than a swipe doing the identical step.
+        animateRotation(to: target, duration: Self.stepDuration(state.mode))
         UserDefaults.standard.set(wrapIndex(target), forKey: "lastIndex")
     }
 
