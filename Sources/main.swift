@@ -165,6 +165,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if CommandLine.arguments.contains("--cpuprobe") { runCpuProbe(); return }
         if CommandLine.arguments.contains("--axprobe") { runAxProbe(dump: false); return }
         if CommandLine.arguments.contains("--axdump") { runAxProbe(dump: true); return }
+        if CommandLine.arguments.contains("--hovertest") {
+            geo = NotchGeometry.find()
+            if let g = geo { state.notchWidth = g.notchRect.width; state.notchHeight = g.notchRect.height }
+            rebuildPanel()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.runHoverTest() }
+            return
+        }
         rebuildPanel()
         setupStatusItem()
         statusMon.onChange = { [weak self] st in self?.state.work = st }
@@ -494,13 +501,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // The trigger must be smaller than the notch, not larger.
             let nr = g.notchRect
             let tr = AppDelegate.triggerRect(nr)
-            results.append(tr.width < nr.width && tr.height < nr.height
-                ? "PASS 触发区·小于刘海本身" : "FAIL 触发区·小于刘海本身")
+            results.append(tr.width < nr.width && tr.height <= nr.height
+                ? "PASS 触发区·窄于刘海本身" : "FAIL 触发区·窄于刘海本身")
             results.append(!tr.contains(NSPoint(x: nr.minX + 4, y: nr.midY))
                 && !tr.contains(NSPoint(x: nr.maxX - 4, y: nr.midY))
                 ? "PASS 触发区·贴边掠过不触发" : "FAIL 触发区·贴边掠过不触发")
-            results.append(!tr.contains(NSPoint(x: nr.midX, y: nr.maxY - 2))
-                ? "PASS 触发区·顶边行走不触发" : "FAIL 触发区·顶边行走不触发")
+            // The top edge is where the pointer LANDS when you throw it at the notch,
+            // so it must stay live — height cannot separate intent, only dwell can.
+            results.append(tr.contains(NSPoint(x: nr.midX, y: nr.maxY - 2))
+                ? "PASS 触发区·顶边仍然可触发" : "FAIL 触发区·顶边仍然可触发")
             results.append(tr.contains(NSPoint(x: nr.midX, y: nr.minY + 4))
                 ? "PASS 触发区·刘海正中下方触发" : "FAIL 触发区·刘海正中下方触发")
             state.mode = 0
@@ -852,6 +861,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Verifies the one signal that cannot be wrong: the app's own stop control.
     // --axprobe polls each target for 20 s; --axdump lists every button label once
     // so busyWords can be tuned per app.
+    /// Drive the real cursor through the real trigger region and report what the app
+    /// actually did. A unit test on the rectangle cannot tell you the rectangle is
+    /// somewhere the pointer never goes; this can.
+    func runHoverTest() {
+        guard let g = geo else { print("HOVER: no notched display"); exit(1) }
+        let f = g.screen.frame
+        let tr = Self.triggerRect(g.notchRect)
+        print("screen \(Int(f.width))x\(Int(f.height))  notch \(Int(g.notchRect.width))x\(Int(g.notchRect.height)) at y \(Int(g.notchRect.minY))–\(Int(g.notchRect.maxY))")
+        print("trigger \(Int(tr.width))x\(Int(tr.height)) at x \(Int(tr.minX))–\(Int(tr.maxX)), y \(Int(tr.minY))–\(Int(tr.maxY))")
+        let saved = NSEvent.mouseLocation
+        var pass = 0, fail = 0
+        // flipped coords for the warp; NSEvent.mouseLocation is bottom-left origin
+        func warpFast(_ p: NSPoint) {
+            CGWarpMouseCursorPosition(CGPoint(x: p.x, y: f.maxY - p.y))
+            CGAssociateMouseAndMouseCursorPosition(1)
+        }
+        func warp(_ p: NSPoint) { warpFast(p); usleep(60_000) }
+        func check(_ name: String, _ p: NSPoint, _ want: Bool) {
+            warp(p)
+            let dwellEnd = Date().addingTimeInterval(Self.openDwell + 0.35)
+            var opened = false
+            while Date() < dwellEnd {
+                mouseMoved()
+                if state.phase == .expanded { opened = true; break }
+                usleep(40_000)
+            }
+            let ok = opened == want
+            print("\(ok ? "PASS" : "FAIL") 悬停·\(name)  at (\(Int(p.x)),\(Int(p.y))) opened=\(opened) want=\(want)")
+            ok ? (pass += 1) : (fail += 1)
+            collapse()
+            warp(NSPoint(x: f.midX, y: f.midY))   // park well away
+            mouseMoved()
+            usleep(60_000)
+        }
+        let n = g.notchRect
+        check("扔到顶边正中（最常见的手势）", NSPoint(x: n.midX, y: f.maxY - 1), true)
+        check("刘海正中偏下", NSPoint(x: n.midX, y: n.minY + 6), true)
+        check("刘海左内侧", NSPoint(x: tr.minX + 3, y: f.maxY - 2), true)
+        check("刘海外左侧 20pt", NSPoint(x: n.minX - 20, y: f.maxY - 2), false)
+        check("刘海外右侧 20pt", NSPoint(x: n.maxX + 20, y: f.maxY - 2), false)
+        check("屏幕正中", NSPoint(x: f.midX, y: f.midY), false)
+
+        // The whole point of the dwell: sweeping from the left-hand menus to the
+        // right-hand status icons crosses the notch, and must not open anything.
+        func sweep(_ name: String, from x0: CGFloat, to x1: CGFloat, ms: Int) {
+            collapse()
+            let steps = 24
+            var opened = false
+            for i in 0...steps {
+                let t = CGFloat(i) / CGFloat(steps)
+                warpFast(NSPoint(x: x0 + (x1 - x0) * t, y: f.maxY - 2))
+                usleep(useconds_t(ms * 1000 / steps))
+                mouseMoved()
+                if state.phase == .expanded { opened = true; break }
+            }
+            let ok = !opened
+            print("\(ok ? "PASS" : "FAIL") 悬停·\(name)  opened=\(opened) want=false")
+            ok ? (pass += 1) : (fail += 1)
+            collapse()
+        }
+        sweep("横穿刘海 300ms（去点右边状态栏）", from: n.minX - 120, to: n.maxX + 120, ms: 300)
+        sweep("横穿刘海 600ms（慢一点）", from: n.minX - 120, to: n.maxX + 120, ms: 600)
+        // …but parking in it still opens, which is the line we are drawing
+        check("穿过之后停住", NSPoint(x: n.midX, y: f.maxY - 2), true)
+        CGWarpMouseCursorPosition(CGPoint(x: saved.x, y: f.maxY - saved.y))
+        print(fail == 0 ? "HOVERTEST ALL PASS (\(pass))" : "HOVERTEST \(fail) FAILED")
+        exit(fail == 0 ? 0 : 1)
+    }
+
     func runAxProbe(dump: Bool) {
         let ok = AXStatus.trusted(prompt: true)
         print("AX TRUSTED: \(ok)")
@@ -957,9 +1035,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 8pt on each side and running to the screen edge — larger than the thing it
     /// represents, in exactly the two directions that traffic comes from.
     static let triggerInsetX: CGFloat = 18
-    /// The top strip is where the cursor travels along the screen edge; the island
-    /// grows downward from the notch, so the bottom is where intent actually lives.
-    static let triggerTopDead: CGFloat = 9
+    /// No dead strip at the top, and the reason is worth writing down because I got
+    /// it backwards once already: on a notched Mac the natural way to aim at the
+    /// notch is to throw the pointer at the top edge, where it stops at y = maxY-1.
+    /// Making the top dead did not filter out accidental traffic — accidental and
+    /// deliberate arrive at exactly the same height — it just made the switcher
+    /// impossible to open. Height cannot separate intent here. Only dwell can.
+    static let triggerTopDead: CGFloat = 0
 
     /// The notch region that opens the switcher.
     static func triggerRect(_ notch: NSRect) -> NSRect {
@@ -1006,7 +1088,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// opens. Passing through takes well under this; deciding to open it does not.
     /// Shrinking the region alone would still fire on a fast diagonal across it.
     static var openDwell: TimeInterval = 0.2
+    /// …and it has to have actually stopped. A pure timer cannot tell a slow drag
+    /// from an arrival: sweeping across the top at a leisurely pace keeps the pointer
+    /// inside the region for longer than any dwell you would be willing to wait
+    /// through. Requiring it to settle within a few points separates the two at any
+    /// speed, and keeps the dwell short enough that a deliberate hover feels instant.
+    static var dwellSlop: CGFloat = 6
     private var dwellSince: Date?
+    private var dwellAt: NSPoint = .zero
 
     /// What a pointer position means, given what is already open.
     enum HoverIntent { case nothing, openSwitcher, openLedger, holdLedger, dropLedger }
@@ -1035,9 +1124,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                     zone: collapsedZone(m, extCount: state.cardLatch.isEmpty ? state.liveRows.count : state.cardLatch.count),
                                     nearLedger: near) {
             case .openSwitcher:
-                let began = dwellSince ?? Date()
-                if dwellSince == nil { dwellSince = began }
-                if Date().timeIntervalSince(began) >= Self.openDwell { dwellSince = nil; expand() }
+                let moved = hypot(m.x - dwellAt.x, m.y - dwellAt.y)
+                if dwellSince == nil || moved > Self.dwellSlop {
+                    dwellSince = Date(); dwellAt = m          // still travelling — start over
+                } else if Date().timeIntervalSince(dwellSince!) >= Self.openDwell {
+                    dwellSince = nil; expand()
+                }
             case .openLedger:
                 dwellSince = nil
                 state.cardLatch = state.liveRows   // freeze the rows for as long as you're reading them

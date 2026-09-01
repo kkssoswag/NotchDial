@@ -216,7 +216,7 @@ Targets live in `Sources/Targets.swift` (name / bundle path / brand tint / plane
 
 ## Debug flags
 
-`--pin` keep expanded · `--snap out.png` offscreen snapshot · `--film dir/` frame-by-frame capture · `--selftest` gesture engine + hit-region + status state-machine tests · `--clicktest` synthesized-click hit-testing test · `--launchtest` measures click→app-activation latency · `--teartest` real tear-launch-retract cycle · `--demo <0|1|2>` scripted showcase run (for screen-recording demos) · `--statustest` scripted status choreography through the real file pipeline · `--cpuprobe` prints each target's measured CPU utilization over 4 s · `--axprobe` polls the Accessibility signal for 24 s (busy / nodes / ms per app) · `--axdump` lists every button label an app exposes, for tuning `AXStatus.busyPrefixes`
+`--hovertest` drives the real cursor through the real trigger region and reports what the app actually did (run it after any hover change) · `--pin` keep expanded · `--snap out.png` offscreen snapshot · `--film dir/` frame-by-frame capture · `--selftest` gesture engine + hit-region + status state-machine tests · `--clicktest` synthesized-click hit-testing test · `--launchtest` measures click→app-activation latency · `--teartest` real tear-launch-retract cycle · `--demo <0|1|2>` scripted showcase run (for screen-recording demos) · `--statustest` scripted status choreography through the real file pipeline · `--cpuprobe` prints each target's measured CPU utilization over 4 s · `--axprobe` polls the Accessibility signal for 24 s (busy / nodes / ms per app) · `--axdump` lists every button label an app exposes, for tuning `AXStatus.busyPrefixes`
 
 ## License
 
