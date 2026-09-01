@@ -489,6 +489,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 ? "PASS 入口锁·延长区入口开账单" : "FAIL 入口锁·延长区入口开账单")
             results.append(hi(true, 0, false) == .dropLedger
                 ? "PASS 入口锁·离开轮廓即收" : "FAIL 入口锁·离开轮廓即收")
+            // The notch is the one spot the cursor crosses by accident all day: every
+            // trip between the left menus and the right status icons goes through it.
+            // The trigger must be smaller than the notch, not larger.
+            let nr = g.notchRect
+            let tr = AppDelegate.triggerRect(nr)
+            results.append(tr.width < nr.width && tr.height < nr.height
+                ? "PASS 触发区·小于刘海本身" : "FAIL 触发区·小于刘海本身")
+            results.append(!tr.contains(NSPoint(x: nr.minX + 4, y: nr.midY))
+                && !tr.contains(NSPoint(x: nr.maxX - 4, y: nr.midY))
+                ? "PASS 触发区·贴边掠过不触发" : "FAIL 触发区·贴边掠过不触发")
+            results.append(!tr.contains(NSPoint(x: nr.midX, y: nr.maxY - 2))
+                ? "PASS 触发区·顶边行走不触发" : "FAIL 触发区·顶边行走不触发")
+            results.append(tr.contains(NSPoint(x: nr.midX, y: nr.minY + 4))
+                ? "PASS 触发区·刘海正中下方触发" : "FAIL 触发区·刘海正中下方触发")
             state.mode = 0
             chk("星轨主体可点", NSPoint(x: cx, y: top - 120), true)
             chk("星轨侧翼穿透", NSPoint(x: cx + 340, y: top - 120), false)
@@ -933,11 +947,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel = p
     }
 
+    /// The pointer has to be properly *inside* the notch, not merely near it, and not
+    /// grazing the very top edge.
+    ///
+    /// The notch sits in the middle of the menu bar, which makes it the one place on
+    /// screen the cursor crosses by accident all day: every trip from the left-hand
+    /// menus to the right-hand status icons goes straight through it, and every reach
+    /// for the top of the screen lands on it. The old zone was the notch *widened* by
+    /// 8pt on each side and running to the screen edge — larger than the thing it
+    /// represents, in exactly the two directions that traffic comes from.
+    static let triggerInsetX: CGFloat = 18
+    /// The top strip is where the cursor travels along the screen edge; the island
+    /// grows downward from the notch, so the bottom is where intent actually lives.
+    static let triggerTopDead: CGFloat = 9
+
+    /// The notch region that opens the switcher.
+    static func triggerRect(_ notch: NSRect) -> NSRect {
+        NSRect(x: notch.minX + triggerInsetX, y: notch.minY,
+               width: max(24, notch.width - 2 * triggerInsetX),
+               height: max(8, notch.height - triggerTopDead))
+    }
+
     // collapsed hover zones: 1 = the notch itself → open the switcher;
     // 2 = the widened status bar beside it → reveal the status card; 0 = neither.
     func collapsedZone(_ m: NSPoint, extCount: Int) -> Int {
         guard let g = geo else { return 0 }
-        if g.notchRect.insetBy(dx: -8, dy: 0).contains(m) { return 1 }
+        if Self.triggerRect(g.notchRect).contains(m) { return 1 }
         let ext = IslandRoot.statusExtension(count: extCount)
         guard ext > 0 else { return 0 }
         let fl = IslandRoot.flare(ext: ext, grown: state.showCard, open: false)
@@ -967,6 +1002,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// enough to survive the pixel of overshoot at the end of a fast move.
     static let hoverSlack: CGFloat = 8
 
+    /// How long the pointer must hold still inside the notch before the switcher
+    /// opens. Passing through takes well under this; deciding to open it does not.
+    /// Shrinking the region alone would still fire on a fast diagonal across it.
+    static var openDwell: TimeInterval = 0.2
+    private var dwellSince: Date?
+
     /// What a pointer position means, given what is already open.
     enum HoverIntent { case nothing, openSwitcher, openLedger, holdLedger, dropLedger }
 
@@ -994,21 +1035,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                     zone: collapsedZone(m, extCount: state.cardLatch.isEmpty ? state.liveRows.count : state.cardLatch.count),
                                     nearLedger: near) {
             case .openSwitcher:
-                expand()
+                let began = dwellSince ?? Date()
+                if dwellSince == nil { dwellSince = began }
+                if Date().timeIntervalSince(began) >= Self.openDwell { dwellSince = nil; expand() }
             case .openLedger:
+                dwellSince = nil
                 state.cardLatch = state.liveRows   // freeze the rows for as long as you're reading them
                 state.showCard = true
                 panel?.ignoresMouseEvents = true   // still in the top strip: menu bar stays clickable
             case .holdLedger:
+                dwellSince = nil
                 // in the grown ledger below the strip: rows take clicks
                 let inStrip = m.y > g.windowRect.maxY - state.notchHeight - 2
                 panel?.ignoresMouseEvents = inStrip || !card.contains(m)
             case .dropLedger:
+                dwellSince = nil
                 state.showCard = false
                 state.cardLatch = []
                 panel?.ignoresMouseEvents = true
             case .nothing:
-                break
+                dwellSince = nil
             }
         case .expanded:
             let island = hoverRectGlobal()
@@ -1083,6 +1129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         state.phase = .collapsed
         state.showCard = false
         state.cardLatch = []
+        dwellSince = nil
         panel?.ignoresMouseEvents = true
         gestureAcc = 0
         stepsInGesture = 0
