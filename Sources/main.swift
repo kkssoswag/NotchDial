@@ -501,11 +501,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // The trigger must be smaller than the notch, not larger.
             let nr = g.notchRect
             let tr = AppDelegate.triggerRect(nr)
-            results.append(tr.width < nr.width && tr.height <= nr.height
-                ? "PASS 触发区·窄于刘海本身" : "FAIL 触发区·窄于刘海本身")
-            results.append(!tr.contains(NSPoint(x: nr.minX + 4, y: nr.midY))
-                && !tr.contains(NSPoint(x: nr.maxX - 4, y: nr.midY))
-                ? "PASS 触发区·贴边掠过不触发" : "FAIL 触发区·贴边掠过不触发")
+            // Never WIDER than the notch — the old region ran 8pt past it on each
+            // side, which is how it caught traffic that was only passing by.
+            results.append(tr.width <= nr.width && tr.height <= nr.height
+                ? "PASS 触发区·不宽于刘海本身" : "FAIL 触发区·不宽于刘海本身")
+            // …and never narrower either: the cursor is invisible over the cutout, so
+            // people aim at the edge of the black shape, not at its middle.
+            results.append(tr.contains(NSPoint(x: nr.minX + 2, y: nr.maxY - 2))
+                && tr.contains(NSPoint(x: nr.maxX - 2, y: nr.maxY - 2))
+                ? "PASS 触发区·刘海边缘可触发" : "FAIL 触发区·刘海边缘可触发")
+            results.append(!tr.contains(NSPoint(x: nr.minX - 6, y: nr.maxY - 2))
+                && !tr.contains(NSPoint(x: nr.maxX + 6, y: nr.maxY - 2))
+                ? "PASS 触发区·刘海之外不触发" : "FAIL 触发区·刘海之外不触发")
             // The top edge is where the pointer LANDS when you throw it at the notch,
             // so it must stay live — height cannot separate intent, only dwell can.
             results.append(tr.contains(NSPoint(x: nr.midX, y: nr.maxY - 2))
@@ -923,6 +930,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         sweep("横穿刘海 300ms（去点右边状态栏）", from: n.minX - 120, to: n.maxX + 120, ms: 300)
         sweep("横穿刘海 600ms（慢一点）", from: n.minX - 120, to: n.maxX + 120, ms: 600)
+        sweep("极慢横穿 3 秒", from: n.minX - 120, to: n.maxX + 120, ms: 3000)
+
+        // A hand is not a teleport. It travels in, and then it rests — badly, with a
+        // couple of points of tremor. Warping straight to a point and holding it
+        // perfectly still is a test that a real hand can still fail.
+        func handApproach(_ name: String, _ p: NSPoint) {
+            collapse()
+            var opened = false
+            for i in 0...20 {                                  // travel up to the notch
+                warpFast(NSPoint(x: p.x, y: f.midY + (p.y - f.midY) * CGFloat(i) / 20))
+                usleep(12_000); mouseMoved()
+            }
+            for _ in 0..<40 {                                  // and rest, unsteadily
+                warpFast(NSPoint(x: p.x + .random(in: -3...3), y: p.y + .random(in: -2...2)))
+                usleep(50_000); mouseMoved()
+                if state.phase == .expanded { opened = true; break }
+            }
+            print("\(opened ? "PASS" : "FAIL") 悬停·\(name)  opened=\(opened) want=true")
+            opened ? (pass += 1) : (fail += 1)
+            collapse()
+        }
+        handApproach("一只手移上去、停住、手抖", NSPoint(x: n.midX, y: f.maxY - 3))
+        handApproach("瞄准刘海左边缘", NSPoint(x: n.minX + 3, y: f.maxY - 3))
+        handApproach("瞄准刘海右边缘", NSPoint(x: n.maxX - 3, y: f.maxY - 3))
         // …but parking in it still opens, which is the line we are drawing
         check("穿过之后停住", NSPoint(x: n.midX, y: f.maxY - 2), true)
         CGWarpMouseCursorPosition(CGPoint(x: saved.x, y: f.maxY - saved.y))
@@ -1034,7 +1065,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// for the top of the screen lands on it. The old zone was the notch *widened* by
     /// 8pt on each side and running to the screen edge — larger than the thing it
     /// represents, in exactly the two directions that traffic comes from.
-    static let triggerInsetX: CGFloat = 18
+    /// Exactly the notch — no wider, and no narrower either. Narrower was a mistake
+    /// I could only see on the real machine: the notch is a physical cutout, the
+    /// cursor is invisible while it is over it, so people aim at the *edge* of the
+    /// black shape rather than its middle. Insetting 18pt put the target in a place
+    /// the user cannot see and would not aim for. The old region ran 8pt PAST the
+    /// notch on each side, which is what made it catch stray traffic; matching the
+    /// notch exactly is the honest boundary, and the dwell does the filtering.
+    static let triggerInsetX: CGFloat = 0
     /// No dead strip at the top, and the reason is worth writing down because I got
     /// it backwards once already: on a notched Mac the natural way to aim at the
     /// notch is to throw the pointer at the top edge, where it stops at y = maxY-1.
@@ -1093,9 +1131,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// inside the region for longer than any dwell you would be willing to wait
     /// through. Requiring it to settle within a few points separates the two at any
     /// speed, and keeps the dwell short enough that a deliberate hover feels instant.
-    static var dwellSlop: CGFloat = 6
+    /// Generous enough for a hand resting on a trackpad, and still nowhere near what
+    /// a moving pointer covers: even a languid three-second sweep across the top
+    /// travels ~28pt in one dwell window.
+    static var dwellSlop: CGFloat = 12
     private var dwellSince: Date?
     private var dwellAt: NSPoint = .zero
+    private var lastHoverLog = ""
+    /// What the RUNNING app decides, moment to moment. The unit tests and even the
+    /// cursor-warping hover test drive `mouseMoved()` by hand in a fresh process;
+    /// the deployed app is driven by a global event monitor and a timer instead, and
+    /// that difference is exactly where a working test can sit beside a dead feature.
+    func hoverLog(_ zone: Int, _ m: NSPoint, _ note: String) {
+        guard StatusMonitor.debug else { return }
+        let line = "zone=\(zone) phase=\(state.phase) \(note)"
+        guard line != lastHoverLog else { return }
+        lastHoverLog = line
+        statusMon.logExternal("HOVER \(line) at (\(Int(m.x)),\(Int(m.y)))")
+    }
 
     /// What a pointer position means, given what is already open.
     enum HoverIntent { case nothing, openSwitcher, openLedger, holdLedger, dropLedger }
@@ -1127,8 +1180,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let moved = hypot(m.x - dwellAt.x, m.y - dwellAt.y)
                 if dwellSince == nil || moved > Self.dwellSlop {
                     dwellSince = Date(); dwellAt = m          // still travelling — start over
+                    hoverLog(1, m, "dwell restart moved=\(Int(moved))")
                 } else if Date().timeIntervalSince(dwellSince!) >= Self.openDwell {
                     dwellSince = nil; expand()
+                    hoverLog(1, m, "OPEN")
+                } else {
+                    hoverLog(1, m, "dwelling")
                 }
             case .openLedger:
                 dwellSince = nil

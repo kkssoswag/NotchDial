@@ -251,6 +251,7 @@ final class StatusMonitor {
     /// Held so stop() can remove it. Toggling the feature off and on used to stack
     /// a fresh observer each time, against the same live monitor.
     private var activateObserver: NSObjectProtocol?
+    func logExternal(_ s: String) { log(s) }
     private func log(_ s: String) {
         guard Self.debug else { return }
         guard let d = "\(Self.stamper.string(from: Date())) \(s)\n".data(using: .utf8) else { return }
