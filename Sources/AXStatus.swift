@@ -47,8 +47,10 @@ enum AXStatus {
         return name.isEmpty ? nil : name
     }
 
-    static var maxNodes = 2600
-    static var maxDepth = 26
+    // Big, because a cold find has to cross a rendered conversation to reach the
+    // sidebar, and it only ever happens when both caches have missed.
+    static var maxNodes = 14000
+    static var maxDepth = 40
 
     // MARK: permission
     static func trusted(prompt: Bool = false) -> Bool {
@@ -107,6 +109,14 @@ enum AXStatus {
     private static func string(_ el: AXUIElement, _ attr: String) -> String? {
         copy(el, attr as CFString) as? String
     }
+    private static func ancestor(_ el: AXUIElement, up: Int) -> AXUIElement {
+        var cur = el
+        for _ in 0..<up {
+            guard let p = copy(cur, "AXParent" as CFString) else { break }
+            cur = unsafeBitCast(p, to: AXUIElement.self)
+        }
+        return cur
+    }
     private static func kids(_ el: AXUIElement) -> [AXUIElement] {
         copy(el, kChildren) as? [AXUIElement] ?? []
     }
@@ -159,11 +169,26 @@ enum AXStatus {
     /// element is two calls, and it answers the whole question — the row itself flips
     /// between "Running <name>" and "Mark as unread <name>".
     private static var rowCache: [pid_t: AXUIElement] = [:]
+    /// An ancestor of the row — the sidebar, roughly. When the row element itself is
+    /// re-rendered away, re-finding it inside this subtree costs a few dozen nodes
+    /// instead of a walk across the whole window.
+    private static var scopeCache: [pid_t: AXUIElement] = [:]
     private static var lastFull: [pid_t: Date] = [:]
     /// Floor between full walks. The cached row carries the signal at 1 Hz; walking
     /// is only for (re)finding it, and must stay rare enough to be harmless.
     static var fullScanEvery: TimeInterval = 4
-    static func forgetRows() { rowCache = [:]; lastFull = [:] }
+    static func forgetRows() { rowCache = [:]; scopeCache = [:]; lastFull = [:] }
+
+    /// Roles that cannot contain a sidebar row, so the walk never descends into them.
+    /// This is what keeps a long conversation from eating the node budget: the
+    /// transcript is thousands of text nodes, and the row we want is a button in the
+    /// navigation list. Measured: the row sits at BFS depth 18, and with the
+    /// transcript rendered, levels 10-17 alone blew past 2600 nodes — so the search
+    /// simply never arrived, and the status went silent for over an hour.
+    static let opaqueRoles: Set<String> = [
+        "AXStaticText", "AXHeading", "AXParagraph", "AXLink", "AXImage",
+        "AXTextField", "AXTextArea", "AXCell", "AXMenuBar", "AXToolbar",
+    ]
 
     /// Read the cached row, if it still exists and still says something we know.
     private static func readCachedRow(_ pid: pid_t) -> Probe? {
@@ -187,15 +212,33 @@ enum AXStatus {
             c.ms = Int(Date().timeIntervalSince(t0) * 1000)
             return c
         }
+        // The row element died but the list it lives in probably didn't. Re-finding it
+        // inside that subtree is tens of nodes; starting from the window is thousands.
+        if let scope = scopeCache[pid] {
+            var s = walk(from: [scope], pid: pid, budget: 900)
+            if !s.running.isEmpty || !s.settled.isEmpty {
+                s.ms = Int(Date().timeIntervalSince(t0) * 1000)
+                s.hit = s.hit.isEmpty ? s.hit : "scoped " + s.hit
+                return s
+            }
+            scopeCache[pid] = nil
+        }
         if let last = lastFull[pid], Date().timeIntervalSince(last) < fullScanEvery {
             // Not allowed to walk yet, and nothing cached: say so honestly rather
             // than reporting an idle we did not actually observe.
             return Probe(busy: false, nodes: 0, ms: 0, hit: "", running: [], settled: [], complete: false)
         }
         lastFull[pid] = Date()
+        let roots: [AXUIElement] = copy(AXUIElementCreateApplication(pid), kWindows) as? [AXUIElement]
+            ?? kids(AXUIElementCreateApplication(pid))
+        var p = walk(from: roots, pid: pid, budget: maxNodes)
+        p.ms = Int(Date().timeIntervalSince(t0) * 1000)
+        return p
+    }
+
+    private static func walk(from roots: [AXUIElement], pid: pid_t, budget: Int) -> Probe {
         var p = Probe()
-        let app = AXUIElementCreateApplication(pid)
-        var level: [AXUIElement] = copy(app, kWindows) as? [AXUIElement] ?? kids(app)
+        var level: [AXUIElement] = roots
         var depth = 0
         // Walking the whole tree and reading five attributes per node is thousands of
         // synchronous IPC calls into an Electron app — once a second, forever, that is
@@ -204,11 +247,11 @@ enum AXStatus {
         // live do we pay for the full walk, and that is exactly when we need it —
         // the finished label ("Mark as unread <name>") is the evidence that a session
         // really stopped, and an idle app is cheap to read.
-        outer: while !level.isEmpty, depth < maxDepth, p.nodes < maxNodes {
+        outer: while !level.isEmpty, depth < maxDepth, p.nodes < budget {
             var next: [AXUIElement] = []
             for el in level {
                 p.nodes += 1
-                if p.nodes >= maxNodes { p.complete = false; break }
+                if p.nodes >= budget { p.complete = false; break }
                 let r = role(el)
                 if r == "AXButton" || r == "AXRadioButton" || r == "AXMenuButton" || r == "AXImage" || r == "AXStaticText" {
                     for a in labelAttrs {
@@ -221,6 +264,7 @@ enum AXStatus {
                             // later read "Mark as unread <name>", so from here on the
                             // whole signal costs two IPC calls instead of a walk.
                             rowCache[pid] = el
+                            scopeCache[pid] = ancestor(el, up: 4)
                             break outer
                         }
                         if let n = sessionName(s, prefix: settledPrefix) { p.settled.append(n); break }
@@ -236,14 +280,17 @@ enum AXStatus {
                     p.busy = true
                     if p.hit.isEmpty { p.hit = r }
                 }
-                next.append(contentsOf: kids(el))
+                if !opaqueRoles.contains(r) { next.append(contentsOf: kids(el)) }
             }
             if !p.complete { break }
             level = next
             depth += 1
         }
-        if !level.isEmpty && depth >= maxDepth { p.complete = false }
-        p.ms = Int(Date().timeIntervalSince(t0) * 1000)
+        // Running out of DEPTH is not the same as running out of room. With the
+        // content leaves pruned, reaching depth 40 means we examined everything that
+        // could plausibly hold a control — so that still counts as a complete look.
+        // Only exhausting the node budget means we genuinely stopped early, and only
+        // that may be reported as "I could not tell".
         return p
     }
 
