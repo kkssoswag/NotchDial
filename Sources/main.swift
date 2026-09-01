@@ -741,6 +741,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // the turn really ends: the interrupt control goes away
         otick(.init(nodes: 90, running: [], settled: [open], openSession: open, openBusy: false, openChecked: true))
         results.append(om.states[0] == .done ? "PASS 回合·停止键消失才收工" : "FAIL 回合·停止键消失才收工")
+        // The other blind spot, measured live: at 09:15:05 the user hit send, the
+        // sidebar flipped instantly, and the interrupt control had not appeared yet.
+        // Letting the composer veto the sidebar stamped ✓ three seconds into a turn.
+        om.clearDone(kTargets[0])
+        otick(.init(nodes: 90, running: [open], openSession: open, openBusy: false, openChecked: true))
+        otick(.init(nodes: 90, running: [open], openSession: open, openBusy: false, openChecked: true))
+        results.append(om.states[0] == .working
+            ? "PASS 回合·停止键还没出现不算收工" : "FAIL 回合·停止键还没出现不算收工")
+        otick(.init(nodes: 90, running: [], settled: [open], openSession: open, openBusy: false, openChecked: true))
+        results.append(om.states[0] == .done ? "PASS 回合·两个都静了才收工" : "FAIL 回合·两个都静了才收工")
         // a background session the composer cannot speak for still uses the sidebar
         om.clearDone(kTargets[0])
         let bg = "后台会话"
