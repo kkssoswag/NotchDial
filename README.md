@@ -55,9 +55,8 @@ So NotchDial reads the truth instead, in this order:
    holds the previous state instead of inventing an idle.
 
    Needs a one-time grant: **menu bar → 精确状态**, or System Settings › Privacy &
-   Security › Accessibility › NotchDial. Nothing else to configure, ever. (Ad-hoc
-   signed builds change identity on every rebuild, so macOS may ask again after you
-   rebuild from source.)
+   Security › Accessibility › NotchDial. Nothing else to configure, ever — see
+   **Keeping the permission** below if you build from source often.
 
 2. **Hooks (exact — the agent tells you).** For **local** Claude Code sessions this
    beats everything above, because nothing you can observe from outside is as good as
@@ -112,6 +111,28 @@ signal and state change to `~/Library/Logs/NotchDial/status.log` (mode 0600, rot
 at 4 MB). Matched labels are your chat titles, read out of another app's window, so
 they are redacted to a length by default; add `statusDebugLabels -bool true` if you
 are tuning `busyPrefixes` and need to see the text.
+
+### Keeping the permission
+
+macOS ties the Accessibility grant to the app's **code signature**, and `build.sh`
+falls back to an ad-hoc signature — a new identity every single build. So every
+rebuild silently drops the permission, and a stale TCC row can show the toggle ON
+while the app is actually denied. If you are iterating on the source, do this once:
+
+1. **Keychain Access → Certificate Assistant → Create a Certificate…**
+2. Name `NotchDial Local Signing`, Identity Type **Self Signed Root**,
+   Certificate Type **Code Signing**. Create.
+3. Rebuild. `build.sh` finds the identity by name and uses it (or set
+   `NOTCHDIAL_SIGN_ID` to your own name).
+
+Grant Accessibility once more after that first signed build; from then on the
+identity is stable and the grant survives every rebuild. Costs nothing and involves
+no Apple account — it is a local certificate, so other people's Macs still treat
+your build as unidentified. Shipping to other people is a different problem: that
+needs a **Developer ID** certificate plus notarization, which requires the paid
+[Apple Developer Program](https://developer.apple.com/programs/) ($99/year). The Mac
+App Store is not an option for this app at all — it requires sandboxing, and the
+Accessibility API is not available to sandboxed apps.
 
 ## ⚡ One-prompt setup with your AI agent
 
