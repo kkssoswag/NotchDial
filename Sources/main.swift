@@ -930,7 +930,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         sweep("横穿刘海 300ms（去点右边状态栏）", from: n.minX - 120, to: n.maxX + 120, ms: 300)
         sweep("横穿刘海 600ms（慢一点）", from: n.minX - 120, to: n.maxX + 120, ms: 600)
-        sweep("极慢横穿 3 秒", from: n.minX - 120, to: n.maxX + 120, ms: 3000)
+        // A three-second crawl through the notch used to be in here, asserting it
+        // must not open. Deleted deliberately: at 140 pt/s it is not distinguishable
+        // from a slow hover — because it *is* one. Nobody spends three seconds
+        // accidentally dragging through the notch, while people hover gently all the
+        // time. The test was demanding a distinction that does not exist, and paying
+        // for it with the gesture the user actually makes.
 
         // A hand is not a teleport. It travels in, and then it rests — badly, with a
         // couple of points of tremor. Warping straight to a point and holding it
@@ -952,6 +957,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             collapse()
         }
         handApproach("一只手移上去、停住、手抖", NSPoint(x: n.midX, y: f.maxY - 3))
+
+        // Straight from a recording of a real attempt: the pointer inside the notch
+        // for seconds on end, gliding gently around, never opening. Nobody hovering a
+        // target actually stops — they slow down. This is the case that mattered.
+        func glide(_ name: String, ms: Int) {
+            collapse()
+            var opened = false
+            let steps = ms / 16
+            for i in 0...steps {                     // ~6pt per event, the measured rate
+                let t = CGFloat(i)
+                warpFast(NSPoint(x: n.midX + 40 * sin(t / 7), y: f.maxY - 4 - 10 * abs(cos(t / 11))))
+                usleep(16_000); mouseMoved()
+                if state.phase == .expanded { opened = true; break }
+            }
+            print("\(opened ? "PASS" : "FAIL") 悬停·\(name)  opened=\(opened) want=true")
+            opened ? (pass += 1) : (fail += 1)
+            collapse()
+        }
+        glide("在刘海里慢慢滑动（视频里的动作）", ms: 1500)
         handApproach("瞄准刘海左边缘", NSPoint(x: n.minX + 3, y: f.maxY - 3))
         handApproach("瞄准刘海右边缘", NSPoint(x: n.maxX - 3, y: f.maxY - 3))
         // …but parking in it still opens, which is the line we are drawing
@@ -1125,18 +1149,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// How long the pointer must hold still inside the notch before the switcher
     /// opens. Passing through takes well under this; deciding to open it does not.
     /// Shrinking the region alone would still fire on a fast diagonal across it.
-    static var openDwell: TimeInterval = 0.2
+    static var openDwell: TimeInterval = 0.22
     /// …and it has to have actually stopped. A pure timer cannot tell a slow drag
     /// from an arrival: sweeping across the top at a leisurely pace keeps the pointer
     /// inside the region for longer than any dwell you would be willing to wait
     /// through. Requiring it to settle within a few points separates the two at any
     /// speed, and keeps the dwell short enough that a deliberate hover feels instant.
-    /// Generous enough for a hand resting on a trackpad, and still nowhere near what
-    /// a moving pointer covers: even a languid three-second sweep across the top
-    /// travels ~28pt in one dwell window.
-    static var dwellSlop: CGFloat = 12
-    private var dwellSince: Date?
-    private var dwellAt: NSPoint = .zero
+    /// Speed, not stillness. Requiring the pointer to stay within a few points of
+    /// where the dwell began sounds like the same thing and is not: nobody hovering
+    /// a target actually stops, they *slow down*, and the log of a real attempt is
+    /// wall-to-wall `dwell restart moved=13` — inside the region for seconds, gliding
+    /// gently, never opening. Transits are what we want to reject, and transits are
+    /// distinguished by how fast they are going, not by how far they have got.
+    /// A menu-bar crossing runs 800–2000 pt/s; a hover glide is a few hundred.
+    static var maxHoverSpeed: CGFloat = 600
+    private var zoneSince: Date?
+    private var lastPos: NSPoint = .zero
+    private var lastPosAt: Date?
+    private var speed: CGFloat = 0
+
+    /// Exponentially smoothed pointer speed in points/second.
+    private func trackSpeed(_ m: NSPoint, now: Date) {
+        defer { lastPos = m; lastPosAt = now }
+        guard let t = lastPosAt else { return }
+        let dt = now.timeIntervalSince(t)
+        guard dt > 0.002 else { return }
+        let v = hypot(m.x - lastPos.x, m.y - lastPos.y) / CGFloat(dt)
+        speed = speed * 0.6 + v * 0.4
+    }
     private var lastHoverLog = ""
     /// What the RUNNING app decides, moment to moment. The unit tests and even the
     /// cursor-warping hover test drive `mouseMoved()` by hand in a fresh process;
@@ -1165,6 +1205,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func mouseMoved() {
         guard enabled, let g = geo else { return }
         let m = NSEvent.mouseLocation
+        trackSpeed(m, now: Date())
         switch state.phase {
         case .collapsed:
             // Where you came in decides what you get, and it keeps deciding until you
@@ -1177,33 +1218,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                     zone: collapsedZone(m, extCount: state.cardLatch.isEmpty ? state.liveRows.count : state.cardLatch.count),
                                     nearLedger: near) {
             case .openSwitcher:
-                let moved = hypot(m.x - dwellAt.x, m.y - dwellAt.y)
-                if dwellSince == nil || moved > Self.dwellSlop {
-                    dwellSince = Date(); dwellAt = m          // still travelling — start over
-                    hoverLog(1, m, "dwell restart moved=\(Int(moved))")
-                } else if Date().timeIntervalSince(dwellSince!) >= Self.openDwell {
-                    dwellSince = nil; expand()
-                    hoverLog(1, m, "OPEN")
+                let began = zoneSince ?? Date()
+                if zoneSince == nil { zoneSince = began }
+                let held = Date().timeIntervalSince(began)
+                if held >= Self.openDwell && speed < Self.maxHoverSpeed {
+                    zoneSince = nil; expand()
+                    hoverLog(1, m, "OPEN held=\(Int(held * 1000))ms v=\(Int(speed))")
                 } else {
-                    hoverLog(1, m, "dwelling")
+                    hoverLog(1, m, "held=\(Int(held * 1000))ms v=\(Int(speed))")
                 }
             case .openLedger:
-                dwellSince = nil
+                zoneSince = nil
                 state.cardLatch = state.liveRows   // freeze the rows for as long as you're reading them
                 state.showCard = true
                 panel?.ignoresMouseEvents = true   // still in the top strip: menu bar stays clickable
             case .holdLedger:
-                dwellSince = nil
+                zoneSince = nil
                 // in the grown ledger below the strip: rows take clicks
                 let inStrip = m.y > g.windowRect.maxY - state.notchHeight - 2
                 panel?.ignoresMouseEvents = inStrip || !card.contains(m)
             case .dropLedger:
-                dwellSince = nil
+                zoneSince = nil
                 state.showCard = false
                 state.cardLatch = []
                 panel?.ignoresMouseEvents = true
             case .nothing:
-                dwellSince = nil
+                zoneSince = nil
             }
         case .expanded:
             let island = hoverRectGlobal()
@@ -1278,7 +1318,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         state.phase = .collapsed
         state.showCard = false
         state.cardLatch = []
-        dwellSince = nil
+        zoneSince = nil
         panel?.ignoresMouseEvents = true
         gestureAcc = 0
         stepsInGesture = 0
