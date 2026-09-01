@@ -83,7 +83,8 @@ enum AXStatus {
     /// hand out references into a dead tree.
     static func forget(pid: pid_t) {
         lock.lock()
-        activated.remove(pid); rowCache[pid] = nil; scopeCache[pid] = nil; lastFull[pid] = nil
+        activated.remove(pid); rowCache[pid] = nil; scopeCache[pid] = nil
+        lastFull[pid] = nil; lastDiscover[pid] = nil
         lock.unlock()
     }
     static func forgetActivation(pid: pid_t) { forget(pid: pid) }
@@ -177,7 +178,16 @@ enum AXStatus {
     /// the moment it was killed). Once the row has been found, re-reading that single
     /// element is two calls, and it answers the whole question — the row itself flips
     /// between "Running <name>" and "Mark as unread <name>".
-    private static var rowCache: [pid_t: AXUIElement] = [:]
+    /// Every session row the sidebar shows, by name — not just the one that happened
+    /// to be running when we last walked. One app runs many sessions at once, and
+    /// watching only the first meant the notch stamped ✓ the moment *that* one
+    /// finished while the others were still going. Rows are kept whatever they say:
+    /// a session already in the list flips to "Running" the instant you send, so
+    /// holding its element is what makes a new turn show up immediately.
+    private static var rowCache: [pid_t: [String: AXUIElement]] = [:]
+    /// Bound on how many rows we agree to watch; a long sidebar is not a reason to
+    /// spend unbounded IPC every second.
+    static var maxWatchedRows = 24
     /// An ancestor of the row — the sidebar, roughly. When the row element itself is
     /// re-rendered away, re-finding it inside this subtree costs a few dozen nodes
     /// instead of a walk across the whole window.
@@ -186,7 +196,20 @@ enum AXStatus {
     /// Floor between full walks. The cached row carries the signal at 1 Hz; walking
     /// is only for (re)finding it, and must stay rare enough to be harmless.
     static var fullScanEvery: TimeInterval = 4
-    static func forgetRows() { rowCache = [:]; scopeCache = [:]; lastFull = [:] }
+    static func forgetRows() { rowCache = [:]; scopeCache = [:]; lastFull = [:]; lastDiscover = [:] }
+    private static var lastDiscover: [pid_t: Date] = [:]
+    /// How often to go looking for sessions we have never seen. Known rows are read
+    /// every sweep, so this only has to catch a brand-new chat.
+    static var discoverEvery: TimeInterval = 12
+
+    /// Bring a session to the front by pressing its own sidebar row. We are already
+    /// holding the element, so "jump to that session" is one AX call rather than a
+    /// guess at the app's URL scheme.
+    static func press(pid: pid_t, name: String) -> Bool {
+        lock.lock(); let el = rowCache[pid]?[name]; lock.unlock()
+        guard let el = el else { return false }
+        return AXUIElementPerformAction(el, kAXPressAction as CFString) == .success
+    }
 
     /// Roles that cannot contain a sidebar row, so the walk never descends into them.
     /// This is what keeps a long conversation from eating the node budget: the
@@ -199,26 +222,53 @@ enum AXStatus {
         "AXTextField", "AXTextArea", "AXCell", "AXMenuBar", "AXToolbar",
     ]
 
-    /// Read the cached row, if it still exists and still says something we know.
-    private static func readCachedRow(_ pid: pid_t) -> Probe? {
-        lock.lock(); let cached = rowCache[pid]; lock.unlock()
-        guard let el = cached else { return nil }
-        for a in labelAttrs {
-            guard let s = string(el, a), !s.isEmpty else { continue }
-            if let n = sessionName(s, prefix: runPrefix) {
-                return Probe(busy: true, nodes: 1, ms: 0, hit: "cached \(a)=\(s)", running: [n], settled: [], complete: true)
+    /// Read every cached row. Each one reports for itself, so N sessions cost 2N IPC
+    /// calls and the answer is exact for all of them rather than for whichever was
+    /// found first.
+    private static func readCachedRows(_ pid: pid_t) -> Probe? {
+        lock.lock(); let cached = rowCache[pid] ?? [:]; lock.unlock()
+        guard !cached.isEmpty else { return nil }
+        var p = Probe(); p.complete = true
+        var dead: [String] = []
+        for (name, el) in cached {
+            var seen = false
+            for a in labelAttrs {
+                guard let s = string(el, a), !s.isEmpty else { continue }
+                if let n = sessionName(s, prefix: runPrefix) {
+                    p.running.append(n); p.busy = true
+                    if p.hit.isEmpty { p.hit = "cached \(a)=\(s)" }
+                    seen = true; break
+                }
+                if let n = sessionName(s, prefix: settledPrefix) { p.settled.append(n); seen = true; break }
             }
-            if let n = sessionName(s, prefix: settledPrefix) {
-                return Probe(busy: false, nodes: 1, ms: 0, hit: "", running: [], settled: [n], complete: true)
-            }
+            if !seen { dead.append(name) }
         }
-        lock.lock(); rowCache[pid] = nil; lock.unlock()   // re-rendered; the next walk finds it
-        return nil
+        p.nodes = cached.count - dead.count
+        if !dead.isEmpty {
+            lock.lock(); for n in dead { rowCache[pid]?[n] = nil }; lock.unlock()
+        }
+        // A row can be renamed as well as re-rendered, so a name we no longer see is
+        // not proof the session ended — only a walk can say that.
+        return p.nodes > 0 ? p : nil
     }
 
     static func probe(pid: pid_t) -> Probe {
         let t0 = Date()
-        if var c = readCachedRow(pid) {
+        if var c = readCachedRows(pid) {
+            // Known rows answered. Still go looking for sessions we have never seen,
+            // but rarely — a brand-new chat is the only thing this can discover, and
+            // an existing one already flips under us the moment it starts.
+            lock.lock(); let seen = lastDiscover[pid]; lock.unlock()
+            if seen == nil || Date().timeIntervalSince(seen!) >= discoverEvery {
+                lock.lock(); lastDiscover[pid] = Date(); lock.unlock()
+                let roots: [AXUIElement] = copy(AXUIElementCreateApplication(pid), kWindows) as? [AXUIElement] ?? []
+                let w = walk(from: roots, pid: pid, budget: maxNodes)
+                if w.complete, !(w.running.isEmpty && w.settled.isEmpty) {
+                    var m = w
+                    m.ms = Int(Date().timeIntervalSince(t0) * 1000)
+                    return m
+                }
+            }
             c.ms = Int(Date().timeIntervalSince(t0) * 1000)
             return c
         }
@@ -247,6 +297,19 @@ enum AXStatus {
         return p
     }
 
+    /// Keep the row element, and the list it hangs in. Watching a row that is merely
+    /// finished is the point: it is the same element that flips to "Running" the
+    /// instant that session is given something to do.
+    private static func remember(pid: pid_t, name: String, el: AXUIElement) {
+        lock.lock()
+        var m = rowCache[pid] ?? [:]
+        if m[name] == nil && m.count >= maxWatchedRows { lock.unlock(); return }
+        m[name] = el
+        rowCache[pid] = m
+        if scopeCache[pid] == nil { let a = ancestor(el, up: 4); scopeCache[pid] = a }
+        lock.unlock()
+    }
+
     private static func walk(from roots: [AXUIElement], pid: pid_t, budget: Int) -> Probe {
         var p = Probe()
         var level: [AXUIElement] = roots
@@ -258,7 +321,7 @@ enum AXStatus {
         // live do we pay for the full walk, and that is exactly when we need it —
         // the finished label ("Mark as unread <name>") is the evidence that a session
         // really stopped, and an idle app is cheap to read.
-        outer: while !level.isEmpty, depth < maxDepth, p.nodes < budget {
+        while !level.isEmpty, depth < maxDepth, p.nodes < budget {
             var next: [AXUIElement] = []
             for el in level {
                 p.nodes += 1
@@ -271,14 +334,14 @@ enum AXStatus {
                             p.running.append(n)
                             p.busy = true
                             if p.hit.isEmpty { p.hit = "\(r) \(a)=\(s)" }
-                            // Remember the row itself. It is the same element that will
-                            // later read "Mark as unread <name>", so from here on the
-                            // whole signal costs two IPC calls instead of a walk.
-                            let anc = ancestor(el, up: 4)
-                            lock.lock(); rowCache[pid] = el; scopeCache[pid] = anc; lock.unlock()
-                            break outer
+                            remember(pid: pid, name: n, el: el)
+                            break
                         }
-                        if let n = sessionName(s, prefix: settledPrefix) { p.settled.append(n); break }
+                        if let n = sessionName(s, prefix: settledPrefix) {
+                            p.settled.append(n)
+                            remember(pid: pid, name: n, el: el)
+                            break
+                        }
                         if labelIsBusy(s) {
                             p.busy = true
                             if p.hit.isEmpty { p.hit = "\(r) \(a)=\(s)" }

@@ -31,8 +31,8 @@ struct IslandRoot: View {
     @ObservedObject var state: IslandState
     var onLaunch: (AppTarget) -> Void
     var onTapItem: (Int) -> Void
-    var onCardTap: (AppTarget) -> Void
-    @State private var hoverRow = -1
+    var onCardTap: (AppTarget, String?) -> Void
+    @State private var hoverRow: String = ""
     private var isOpen: Bool { state.phase != .collapsed }
 
     var body: some View {
@@ -45,6 +45,26 @@ struct IslandRoot: View {
         let t: AppTarget
         let s: WorkState
         var id: Int { t.id }
+    }
+    /// One ledger line. An app with named sessions contributes one line per session;
+    /// an app without them (Cursor, Codex expose no session vocabulary) contributes
+    /// a single line for itself, which is all it can honestly claim.
+    struct LedgerRow: Identifiable {
+        let t: AppTarget
+        let s: WorkState
+        let session: String?
+        let since: Date?
+        var id: String { "\(t.id)/\(session ?? "")" }
+        var title: String { session ?? t.name }
+    }
+    private var ledgerRows: [LedgerRow] {
+        statusList.flatMap { e -> [LedgerRow] in
+            let ss = state.workSessions[e.t.id] ?? []
+            guard !ss.isEmpty else {
+                return [LedgerRow(t: e.t, s: e.s, session: nil, since: state.workSince[e.t.id])]
+            }
+            return ss.map { LedgerRow(t: e.t, s: $0.state, session: $0.name, since: $0.since) }
+        }
     }
     private var statusList: [StatusEntry] {
         let live = kTargets.compactMap { t -> StatusEntry? in
@@ -89,7 +109,7 @@ struct IslandRoot: View {
     private var island: some View {
         let ext = isOpen ? 0 : capsuleExt
         let grown = !isOpen && state.showCard && !statusList.isEmpty
-        let growH = grown ? Self.statusGrowth(rows: statusList.count) : 0
+        let growH = grown ? Self.statusGrowth(rows: max(statusList.count, ledgerRows.count)) : 0
         let flare: CGFloat = Self.flare(ext: ext, grown: grown, open: isOpen)
         let barW = state.notchWidth + 2 * ext
         let sz = isOpen ? state.openSize() : CGSize(width: barW + 2 * flare, height: state.notchHeight + growH)
@@ -195,7 +215,7 @@ struct IslandRoot: View {
             if grown {
                 // receipt rows: icon + name, state told by the glyph alone — click to jump
                 VStack(spacing: 0) {
-                    ForEach(Array(statusList.enumerated()), id: \.element.id) { idx, e in
+                    ForEach(Array(ledgerRows.enumerated()), id: \.element.id) { idx, e in
                         HStack(spacing: 10) {
                             if let img = IconCache.icon(for: e.t) {
                                 Image(nsImage: img)
@@ -208,15 +228,19 @@ struct IslandRoot: View {
                             // half its width and said nothing. How long it has been
                             // running is the one thing you open a ledger to find out.
                             VStack(alignment: .leading, spacing: 1) {
-                                Text(e.t.name)
+                                Text(e.title)
                                     .font(.system(size: 12.5, weight: .semibold))
                                     .foregroundColor(.white.opacity(0.95))
-                                Text(e.s == .working ? "working" : "done")
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Text(e.session == nil ? (e.s == .working ? "working" : "done")
+                                                      : "\(e.t.name) · \(e.s == .working ? "working" : "done")")
                                     .font(.system(size: 10, weight: .medium))
                                     .foregroundColor(e.s == .working ? e.t.tint.opacity(0.85) : .white.opacity(0.42))
+                                    .lineLimit(1)
                             }
                             Spacer(minLength: 8)
-                            ElapsedLabel(since: state.workSince[e.id], running: e.s == .working)
+                            ElapsedLabel(since: e.since, running: e.s == .working)
                             if e.s == .working {
                                 WorkSpinner(tint: e.t.tint, size: 15, lineWidth: 2.2)
                             } else {
@@ -231,11 +255,11 @@ struct IslandRoot: View {
                         )
                         .contentShape(Rectangle())
                         .animation(.easeOut(duration: 0.12), value: hoverRow)
-                        .onTapGesture { onCardTap(e.t) }
+                        .onTapGesture { onCardTap(e.t, e.session) }
                         .onHover { h in
-                            if h { hoverRow = e.id } else if hoverRow == e.id { hoverRow = -1 }
+                            if h { hoverRow = e.id } else if hoverRow == e.id { hoverRow = "" }
                         }
-                        if idx < statusList.count - 1 {
+                        if idx < ledgerRows.count - 1 {
                             Line()
                                 .stroke(Color.white.opacity(0.15), style: StrokeStyle(lineWidth: 1, dash: [3, 4]))
                                 .frame(height: 1)

@@ -91,6 +91,55 @@ final class StatusMonitor {
     /// scrolled away, app quit), holding "working" forever would be its own lie.
     var axUnknownGrace: TimeInterval = 300
 
+    /// One agent session inside an app. Claude runs several at once, so "is Claude
+    /// working" is an aggregate — this is the detail behind it, and the only thing
+    /// worth putting in a ledger you opened in order to find out what is running.
+    struct SessionInfo: Equatable, Identifiable {
+        var target: Int
+        var name: String
+        var state: WorkState
+        var since: Date
+        var id: String { "\(target)/\(name)" }
+    }
+    private(set) var sessions: [Int: [SessionInfo]] = [:]
+    var onSessions: (([Int: [SessionInfo]]) -> Void)?
+    private var sessState: [Int: [String: WorkState]] = [:]
+    private var sessSince: [Int: [String: Date]] = [:]
+
+    /// Fold one sweep's session evidence into the per-session view.
+    private func applySessions(_ id: Int, _ r: AXRead, now: Date) {
+        guard !r.running.isEmpty || !r.settled.isEmpty else { return }
+        var st = sessState[id] ?? [:]
+        var sn = sessSince[id] ?? [:]
+        let running = Set(r.running)
+        for n in running where st[n] != .working {
+            st[n] = .working; sn[n] = now
+        }
+        for n in r.settled {
+            // Only a session we watched working earns a stamp; a row that was already
+            // finished when we first saw it is just part of the furniture.
+            if st[n] == .working {
+                let began = sn[n] ?? now
+                if now.timeIntervalSince(began) >= axMinWork { st[n] = .done; sn[n] = now }
+                else { st[n] = nil; sn[n] = nil }
+            }
+        }
+        sessState[id] = st; sessSince[id] = sn
+    }
+
+    private func rebuildSessions() {
+        var out: [Int: [SessionInfo]] = [:]
+        for (id, m) in sessState {
+            let rows = m.compactMap { (n, s) -> SessionInfo? in
+                guard s != .idle else { return nil }
+                return SessionInfo(target: id, name: n, state: s, since: sessSince[id]?[n] ?? Date())
+            }
+            // newest first: the thing you just started is the thing you are looking for
+            if !rows.isEmpty { out[id] = rows.sorted { $0.since > $1.since } }
+        }
+        if out != sessions { sessions = out; onSessions?(out) }
+    }
+
     /// One sweep's worth of evidence about a single app.
     struct AXRead {
         var busy = false
@@ -211,6 +260,7 @@ final class StatusMonitor {
         hbPrevSize = [:]; hbLastEvent = [:]; hbPrevEvent = [:]; hbActive = []; hbStart = [:]
         axBusy = []; axUsable = []; axStart = [:]; axOwed = []
         axLive = [:]; axUnknownSince = [:]; since = [:]
+        sessState = [:]; sessSince = [:]; sessions = [:]; onSessions?([:])
         axGeneration &+= 1; axInFlight = false; axSweepStarted = nil
         if let o = activateObserver { NSWorkspace.shared.notificationCenter.removeObserver(o) }
         activateObserver = nil
@@ -220,31 +270,58 @@ final class StatusMonitor {
     func clearDone(_ t: AppTarget) {
         autoDone.remove(t.id)
         axOwed.remove(t.id)      // seen — the debt is paid
+        for (n, s) in sessState[t.id] ?? [:] where s == .done { sessState[t.id]?[n] = nil; sessSince[t.id]?[n] = nil }
+        rebuildSessions()
         doneAt[t.id] = nil
         removeFile(t)
         publish()
     }
 
     private func removeFile(_ t: AppTarget) {
-        for f in [Self.slug(t), Self.slug(t) + ".txt"] {
+        for f in statusFiles(t) {
             try? FileManager.default.removeItem(atPath: (dirPath as NSString).appendingPathComponent(f))
         }
     }
 
-    private func fileState(_ t: AppTarget) -> WorkState? {
-        let fm = FileManager.default
-        for f in [Self.slug(t), Self.slug(t) + ".txt"] {
-            let p = (dirPath as NSString).appendingPathComponent(f)
-            guard let data = fm.contents(atPath: p),
-                  let raw = String(data: data, encoding: .utf8) else { continue }
-            let word = raw.split(whereSeparator: { $0.isNewline || $0 == " " }).first.map(String.init)?.lowercased() ?? ""
-            let mtime = (try? fm.attributesOfItem(atPath: p))?[.modificationDate] as? Date
-            let age = mtime.map { Date().timeIntervalSince($0) } ?? .infinity
-            if word == "working" && age < workingTTL { return .working }
-            if word == "done" && age < doneTTL { return .done }
-            if word == "idle" { return .idle }
+    /// Every file belonging to this target: the bare slug, and one per session
+    /// (`claude-code.<session>`). Concurrent sessions each report for themselves —
+    /// sharing one file meant session A's "done" erased the fact that B was still
+    /// working, which is the same bug the Accessibility path had.
+    private func statusFiles(_ t: AppTarget) -> [String] {
+        let base = Self.slug(t)
+        var out = [base, base + ".txt"]
+        if let names = try? FileManager.default.contentsOfDirectory(atPath: dirPath) {
+            out += names.filter { $0.hasPrefix(base + ".") && $0 != base + ".txt" }.sorted()
         }
-        return nil
+        return out
+    }
+
+    /// Read one word out of one file, cheaply and with a bound. A runaway hook that
+    /// appends instead of overwriting should not turn into an unbounded allocation
+    /// twice a second.
+    private func word(inFile p: String) -> (String, TimeInterval)? {
+        guard let a = try? FileManager.default.attributesOfItem(atPath: p),
+              (a[.type] as? FileAttributeType) == .typeRegular else { return nil }
+        guard let fh = FileHandle(forReadingAtPath: p) else { return nil }
+        defer { try? fh.close() }
+        let head = (try? fh.read(upToCount: 64)) ?? Data()
+        guard let raw = String(data: head, encoding: .utf8) else { return nil }
+        let w = raw.split(whereSeparator: { $0.isNewline || $0 == " " }).first.map(String.init)?.lowercased() ?? ""
+        let mtime = a[.modificationDate] as? Date
+        return (w, mtime.map { Date().timeIntervalSince($0) } ?? .infinity)
+    }
+
+    private func fileState(_ t: AppTarget) -> WorkState? {
+        var agg: WorkState? = nil
+        for f in statusFiles(t) {
+            let p = (dirPath as NSString).appendingPathComponent(f)
+            guard let (w, age) = word(inFile: p) else { continue }
+            // any session working wins; a stamp only survives if nothing is working
+            if w == "working" && age < workingTTL { return .working }
+            if w == "done" && age < doneTTL { agg = .done }
+            if w == "idle" && agg == nil { agg = .idle }
+        }
+        return agg
     }
 
     // one heartbeat measurement + state step; injectable for the self-test
@@ -291,6 +368,8 @@ final class StatusMonitor {
     func forgetAX(_ id: Int) {
         axUsable.remove(id); axBusy.remove(id); axOwed.remove(id)
         axLive[id] = nil; axStart[id] = nil; axUnknownSince[id] = nil
+        sessState[id] = nil; sessSince[id] = nil
+        rebuildSessions()
     }
 
     func targetTerminated(_ id: Int, pid: pid_t?) {
@@ -395,6 +474,7 @@ final class StatusMonitor {
             if r.nodes >= 20 || !r.running.isEmpty || !r.settled.isEmpty { axUsable.insert(id) }
             else if r.complete { axUsable.remove(id) }
             guard axUsable.contains(id) else { continue }
+            applySessions(id, r, now: now)
             let busy: Bool
             switch verdict(id, r) {
             case .working:
@@ -436,6 +516,7 @@ final class StatusMonitor {
             let held = live.isEmpty ? "" : " live=\(live.map { "\($0.key):\(Self.redact($0.value.sorted().joined(separator: "|")))" }.sorted())"
             log("AX res=\(res.map { "\($0.key):\($0.value.busy ? "BUSY" : "idle")/\($0.value.nodes)n\($0.value.complete ? "" : "~")" }.sorted()) usable=\(axUsable.sorted()) busy=\(axBusy.sorted())\(held)\(why)")
         }
+        rebuildSessions()
         publish(now: now)
     }
 
@@ -511,6 +592,9 @@ final class StatusMonitor {
                 if doneAt[t.id] == nil { doneAt[t.id] = at }
                 if front == t.path, now.timeIntervalSince(at) >= doneLinger {
                     autoDone.remove(t.id); axOwed.remove(t.id); removeFile(t)
+                    for (n, ss) in sessState[t.id] ?? [:] where ss == .done {
+                        sessState[t.id]?[n] = nil; sessSince[t.id]?[n] = nil
+                    }
                     doneAt[t.id] = nil
                     s = .idle
                 }

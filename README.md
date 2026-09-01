@@ -20,7 +20,7 @@ https://github.com/user-attachments/assets/39c76579-0f78-4b29-822e-a5045ef01156
 
 Kick off a long agent run, switch away, and glance at the notch: while an agent works, the black bar grows past the notch — the working apps' icons fan out as an overlapping deck on the left, and a single aggregate glyph sits on the right (spinner while anyone is still working, rubber stamp once they're all done). Each extra agent costs only the overlap step, so the bar stays compact no matter how many are running. When the task finishes, the spinner pops into a **green ✓ that stays until you actually switch to that app** (or it auto-clears a few seconds after you're already there). Expanded, each mode speaks its own dialect: a rubber-stamped ✓ on the paper ticket, a badge on the orbit icon, a neon tick under the sign.
 
-The widened bar is itself a hover target, split by where you enter: glide in over the **notch** and you get the switcher, as always; glide in over the **widened part beside it** and the bar itself grows downward into a small status ledger — one continuous silhouette whose top corners flare out in concave curves, like it's growing out of the screen edge. One receipt row per agent (icon · name · spinner or rubber stamp), separated by ticket perforation. **Click a row to jump straight to that app**; the top strip still passes every click through to the menu bar, and the ledger retracts the moment you leave.
+The widened bar is itself a hover target, split by where you enter: glide in over the **notch** and you get the switcher, as always; glide in over the **widened part beside it** and the bar itself grows downward into a small status ledger — one continuous silhouette whose top corners flare out in concave curves, like it's growing out of the screen edge. One receipt row per **session** — its name, which agent it belongs to, and how long it has been running — separated by ticket perforation. **Click a row and that session comes to the front**, by pressing its own sidebar row rather than guessing at a URL scheme; the top strip still passes every click through to the menu bar, and the ledger retracts the moment you leave.
 
 ### Where the status comes from
 
@@ -45,11 +45,14 @@ So NotchDial reads the truth instead, in this order:
    keeps its web accessibility tree switched off until an assistive client opts in,
    so NotchDial writes `AXManualAccessibility` on the app first.
 
-   The trick is to watch the row rather than sample the tree. The sidebar row is
+   The trick is to watch the rows rather than sample the tree. A sidebar row is
    *two-sided* — "Running <name>" while live, "Mark as unread <name>" when not — so
-   once it has been located it answers the whole question by itself: 2 IPC calls per
-   second instead of a full walk, and no false "idle" when the tree comes back
-   partial under load (it does, constantly). Walking every second is not a neutral
+   once located it answers for its own session: 2 IPC calls per session per second
+   instead of a full walk, and no false "idle" when the tree comes back partial
+   under load (it does, constantly). **Every** session row is watched, not just the
+   first: one app runs several agents at once, and stopping at the first live row
+   meant whichever session finished first stamped ✓ for the whole app while the
+   others were still going. Walking every second is not a neutral
    act, either: it made all three Electron apps stop reporting their windows at all,
    for ~18 s. Reads are three-valued — working / finished / **unknown** — and unknown
    holds the previous state instead of inventing an idle.
@@ -93,7 +96,7 @@ So NotchDial reads the truth instead, in this order:
    echo done    > ~/.notchdial/status/claude-code   # ✓ until acknowledged
    ```
 
-   The file name is the target's slug: its `name` in `Targets.swift`, lowercased, spaces → `-` (`codex`, `cursor`, `claude-code`). `working` files older than 30 min are ignored (crashed agent); NotchDial deletes the file once the ✓ is acknowledged.
+   The file name is the target's slug: its `name` in `Targets.swift`, lowercased, spaces → `-` (`codex`, `cursor`, `claude-code`). Concurrent sessions each get their own file, `<slug>.<session-id>`, and are aggregated — any session working means the app is working. `working` files older than 30 min are ignored (crashed agent); NotchDial deletes them once the ✓ is acknowledged.
 
    The plugin above writes exactly this; anything else — a wrapper script, a CI job,
    the agent itself — needs only that one `echo`.

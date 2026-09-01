@@ -41,6 +41,9 @@ final class IslandState: ObservableObject {
     @Published var cardLatch: [Int] = []
     /// When each agent entered its current state, for the ledger's elapsed counter.
     @Published var workSince: [Int: Date] = [:]
+    /// The sessions behind each app's aggregate state. One app runs several at once,
+    /// and "Claude Code · working" tells you nothing when three of them are.
+    @Published var workSessions: [Int: [StatusMonitor.SessionInfo]] = [:]
     /// Rows currently worth showing, in slot order.
     var liveRows: [Int] { kTargets.compactMap { work[$0.id] != nil && work[$0.id] != .idle ? $0.id : nil } }
 
@@ -166,6 +169,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupStatusItem()
         statusMon.onChange = { [weak self] st in self?.state.work = st }
         statusMon.onTimes = { [weak self] ts in self?.state.workSince = ts }
+        statusMon.onSessions = { [weak self] ss in self?.state.workSessions = ss }
         if UserDefaults.standard.bool(forKey: "statusEnabled") { statusMon.start() }
         NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved]) { [weak self] _ in self?.mouseMoved() }
         NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved]) { [weak self] e in self?.mouseMoved(); return e }
@@ -668,6 +672,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         tm2.forgetAX(0)
         tm2.applyAX([Int: StatusMonitor.AXRead](), now: tNow.addingTimeInterval(1))
         results.append(heldBefore && tm2.states[0] == nil ? "PASS 状态·失去授权即释放" : "FAIL 状态·失去授权即释放")
+        // One app, several sessions. The probe used to stop at the first live row, so
+        // whichever one finished first stamped ✓ for the whole app while the others
+        // were still going — measured live with two Claude sessions running.
+        let mm = StatusMonitor()
+        mm.dirPath = NSTemporaryDirectory() + "nd-multi-selftest-\(ProcessInfo.processInfo.processIdentifier)"
+        mm.hbEnabled = false
+        mm.frontmostBundlePath = { "/nonexistent" }
+        var mNow2 = Date(timeIntervalSince1970: 9_000_000)
+        func mtick(_ running: [String], _ settled: [String], _ step: TimeInterval = 1) {
+            mNow2 = mNow2.addingTimeInterval(step)
+            mm.applyAX([0: .init(nodes: 90, running: running, settled: settled)], now: mNow2)
+        }
+        let a = "会话甲", b = "会话乙"
+        mtick([a, b], [])
+        mtick([a, b], []); mtick([a, b], [])
+        results.append(mm.sessions[0]?.count == 2 ? "PASS 多会话·两个都记上" : "FAIL 多会话·两个都记上")
+        mtick([b], [a])                      // A finished, B still going
+        let stillBusy = mm.states[0] == .working
+        let aDone = mm.sessions[0]?.first { $0.name == a }?.state == .done
+        let bWorking = mm.sessions[0]?.first { $0.name == b }?.state == .working
+        results.append(stillBusy && aDone && bWorking
+            ? "PASS 多会话·一个收工不代表整体收工" : "FAIL 多会话·一个收工不代表整体收工")
+        mtick([], [a, b])                    // now both are done
+        results.append(mm.states[0] == .done ? "PASS 多会话·全部收工才盖章" : "FAIL 多会话·全部收工才盖章")
+        mm.clearDone(kTargets[0])
+        results.append((mm.sessions[0] ?? []).isEmpty ? "PASS 多会话·确认后清空明细" : "FAIL 多会话·确认后清空明细")
+        // The file protocol had the identical bug: one file per app meant whichever
+        // session finished first wrote "done" over the fact that another was working.
+        let fm2 = StatusMonitor()
+        fm2.dirPath = NSTemporaryDirectory() + "nd-files-selftest-\(ProcessInfo.processInfo.processIdentifier)"
+        fm2.axEnabled = false; fm2.hbEnabled = false
+        fm2.frontmostBundlePath = { "/nonexistent" }
+        try? FileManager.default.createDirectory(atPath: fm2.dirPath, withIntermediateDirectories: true)
+        let slug = StatusMonitor.slug(kTargets[0])
+        func put(_ suffix: String, _ w: String) {
+            try? w.write(toFile: (fm2.dirPath as NSString).appendingPathComponent("\(slug).\(suffix)"),
+                         atomically: true, encoding: .utf8)
+        }
+        var fNow = Date(timeIntervalSince1970: 10_000_000)
+        put("s1", "done"); put("s2", "working")
+        fNow = fNow.addingTimeInterval(1); fm2.tick(cpuSample: [:], now: fNow)
+        results.append(fm2.states[0] == .working ? "PASS 多会话·文件里有人在跑就算跑" : "FAIL 多会话·文件里有人在跑就算跑")
+        put("s2", "done")
+        fNow = fNow.addingTimeInterval(1); fm2.tick(cpuSample: [:], now: fNow)
+        results.append(fm2.states[0] == .done ? "PASS 多会话·文件全收工才盖章" : "FAIL 多会话·文件全收工才盖章")
+        try? FileManager.default.removeItem(atPath: fm2.dirPath)
         // a stamp must stay on screen long enough to be seen, even if you never left
         let lm = StatusMonitor()
         lm.dirPath = NSTemporaryDirectory() + "nd-linger-selftest-\(ProcessInfo.processInfo.processIdentifier)"
@@ -804,7 +854,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let root = IslandRoot(state: state,
                               onLaunch: { [weak self] t in self?.launch(t) },
                               onTapItem: { [weak self] i in self?.rotateTo(i) },
-                              onCardTap: { [weak self] t in self?.launchFromCard(t) })
+                              onCardTap: { [weak self] t, sess in self?.launchFromCard(t, session: sess) })
         let host = PassthroughHostingView(rootView: root)
         host.frame = NSRect(origin: .zero, size: g.windowRect.size)
         p.contentView = host
@@ -994,11 +1044,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // a click on a ledger row jumps straight to that app
-    func launchFromCard(_ t: AppTarget) {
-        if dryLaunch { print("CARDCLICK->\(t.name)"); state.showCard = false; return }
+    /// A click on a ledger row jumps to that app — and, when the row is a named
+    /// session, to that session. We are already holding the sidebar row's own
+    /// element, so opening it is a press on the same control the user would have
+    /// clicked, rather than a guess at a URL scheme the app may not have.
+    func launchFromCard(_ t: AppTarget, session: String? = nil) {
+        if dryLaunch {
+            print("CARDCLICK->\(t.name)\(session.map { "/\($0)" } ?? "")")
+            state.showCard = false; return
+        }
         NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .default)
         Launcher.launch(t)
+        if let session = session, let pid = AXStatus.pid(for: t) {
+            // after activation, or the press lands on a window that is not frontmost
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+                _ = AXStatus.press(pid: pid, name: session)
+            }
+        }
         state.showCard = false
         panel?.ignoresMouseEvents = true
     }
