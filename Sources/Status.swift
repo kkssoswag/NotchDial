@@ -75,6 +75,35 @@ final class StatusMonitor {
     private var axBusy: Set<Int> = []          // agents the UI says are working
     private var axUsable: Set<Int> = []        // apps whose AX tree we can actually read
     private var axStart: [Int: Date] = [:]
+    /// A ✓ the user has not looked at yet. A new burst hides it behind the spinner,
+    /// but must not *pay* it: if that burst is too short to earn a stamp of its own,
+    /// the old one comes back. Without this, one flickering sweep right after a
+    /// finished turn erases the stamp before anyone could have seen it.
+    private var axOwed: Set<Int> = []
+    /// Sessions this app's sidebar has shown as live. We only believe the agent
+    /// stopped once the very same session reappears wearing its finished label —
+    /// absence proves nothing, because the tree comes back partial under load.
+    private var axLive: [Int: Set<String>] = [:]
+    private var axUnknownSince: [Int: Date] = [:]
+    /// If a row we were tracking never comes back at all (session closed, sidebar
+    /// scrolled away, app quit), holding "working" forever would be its own lie.
+    var axUnknownGrace: TimeInterval = 300
+
+    /// One sweep's worth of evidence about a single app.
+    struct AXRead {
+        var busy = false
+        var nodes = 0
+        var running: [String] = []
+        var settled: [String] = []
+        var complete = true
+        init(busy: Bool = false, nodes: Int = 0, running: [String] = [], settled: [String] = [], complete: Bool = true) {
+            self.busy = busy; self.nodes = nodes
+            self.running = running; self.settled = settled; self.complete = complete
+        }
+    }
+
+    /// What one sweep is allowed to conclude.
+    enum AXVerdict { case working, finished, unknown }
 
     private(set) var states: [Int: WorkState] = [:]   // only non-idle entries
     private var timer: Timer?
@@ -147,12 +176,14 @@ final class StatusMonitor {
         states = [:]; autoWorking = []; autoDone = []
         hot = [:]; cold = [:]; prevCPU = [:]; prevTime = nil; doneAt = [:]
         hbPrevSize = [:]; hbLastEvent = [:]; hbPrevEvent = [:]; hbActive = []; hbStart = [:]
-        axBusy = []; axUsable = []; axStart = [:]
+        axBusy = []; axUsable = []; axStart = [:]; axOwed = []
+        axLive = [:]; axUnknownSince = [:]
         onChange?(states)
     }
 
     func clearDone(_ t: AppTarget) {
         autoDone.remove(t.id)
+        axOwed.remove(t.id)      // seen — the debt is paid
         doneAt[t.id] = nil
         removeFile(t)
         publish()
@@ -223,18 +254,21 @@ final class StatusMonitor {
         guard !pids.isEmpty else { return }
         axInFlight = true
         axQueue.async { [weak self] in
-            var out: [Int: (Bool, Int)] = [:]
+            var out: [Int: AXRead] = [:]
+            var hits: [Int: String] = [:]
             for (id, pid) in pids {
                 if AXStatus.enableWebTree(pid: pid) {
                     AXStatus.setTimeout(pid: pid, 0.4)
                     continue   // Chromium needs a beat to build the tree; read it next sweep
                 }
                 let p = AXStatus.probe(pid: pid)
-                out[id] = (p.busy, p.nodes)
+                out[id] = AXRead(busy: p.busy, nodes: p.nodes,
+                                 running: p.running, settled: p.settled, complete: p.complete)
+                if p.busy { hits[id] = p.hit }
             }
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                self.applyAX(out, now: Date())
+                self.applyAX(out, hits: hits, now: Date())
                 self.axInFlight = false
             }
         }
@@ -242,25 +276,81 @@ final class StatusMonitor {
 
     /// A tree with only the window's own chrome in it (a handful of nodes) means the
     /// app never opted in — that app keeps using the fallback signals.
-    func applyAX(_ res: [Int: (Bool, Int)], now: Date) {
+    func applyAX(_ res: [Int: (Bool, Int)], hits: [Int: String] = [:], now: Date) {
+        applyAX(res.mapValues { AXRead(busy: $0.0, nodes: $0.1) }, hits: hits, now: now)
+    }
+
+    /// Weigh one sweep's evidence for one app. The whole point is the third answer:
+    /// a sweep that simply failed to find the row must not be allowed to say "idle".
+    func verdict(_ id: Int, _ r: AXRead) -> AXVerdict {
+        if !r.running.isEmpty {                       // the row says live — done deal
+            axLive[id] = Set(r.running)
+            return .working
+        }
+        if let live = axLive[id], !live.isEmpty {
+            // We know exactly which rows to look for. Only their *finished* labels
+            // settle the question; anything else is a tree we failed to read.
+            let settled = Set(r.settled)
+            let stillOut = live.subtracting(settled)
+            if stillOut.isEmpty { axLive[id] = []; return .finished }
+            axLive[id] = stillOut
+            return .unknown
+        }
+        // Apps with no session vocabulary (Cursor, Codex): a stop control means
+        // working, and only a walk that actually finished may mean idle.
+        if r.busy { return .working }
+        return r.complete ? .finished : .unknown
+    }
+
+    func applyAX(_ res: [Int: AXRead], hits: [Int: String] = [:], now: Date) {
         for (id, r) in res {
-            let (busy, nodes) = r
-            if nodes >= 20 { axUsable.insert(id) } else { axUsable.remove(id) }
+            // A cached single-element read is worth far more than a big walk, so
+            // usability can no longer be judged by node count alone — and a sweep we
+            // were not allowed to make says nothing about whether the app is readable.
+            if r.nodes >= 20 || !r.running.isEmpty || !r.settled.isEmpty { axUsable.insert(id) }
+            else if r.complete { axUsable.remove(id) }
             guard axUsable.contains(id) else { continue }
+            let busy: Bool
+            switch verdict(id, r) {
+            case .working:
+                busy = true
+                axUnknownSince[id] = nil
+            case .finished:
+                busy = false
+                axUnknownSince[id] = nil
+            case .unknown:
+                // Hold whatever we last knew — but not forever.
+                let since = axUnknownSince[id] ?? now
+                axUnknownSince[id] = since
+                if now.timeIntervalSince(since) >= axUnknownGrace {
+                    axLive[id] = []; axUnknownSince[id] = nil
+                    busy = false                       // watchdog: stop pretending
+                } else {
+                    continue                           // no state change at all
+                }
+            }
             if busy {
                 if !axBusy.contains(id) {
                     axBusy.insert(id)
                     axStart[id] = now
+                    if autoDone.contains(id) { axOwed.insert(id) }   // debt, not payment
                     autoDone.remove(id)
                 }
             } else if axBusy.contains(id) {
                 axBusy.remove(id)
-                if now.timeIntervalSince(axStart[id] ?? now) >= axMinWork {
-                    autoDone.insert(id)
-                }
+                let earned = now.timeIntervalSince(axStart[id] ?? now) >= axMinWork
+                if earned || axOwed.contains(id) { autoDone.insert(id) }
+                axOwed.remove(id)
             }
         }
-        if !res.isEmpty { log("AX res=\(res.map { "\($0.key):\($0.value.0 ? "BUSY" : "idle")/\($0.value.1)n" }.sorted()) usable=\(axUsable.sorted()) busy=\(axBusy.sorted())") }
+        if !res.isEmpty {
+            // the hit string is what makes a spurious BUSY identifiable after the fact —
+            // without it every flicker in the log is indistinguishable from a real turn
+            let why = hits.isEmpty ? "" : " hit=\(hits.map { "\($0.key):\($0.value)" }.sorted())"
+            let live = axLive.filter { !$0.value.isEmpty }
+            let held = live.isEmpty ? "" : " live=\(live.map { "\($0.key):\($0.value.sorted().joined(separator: "|"))" }.sorted())"
+            log("AX res=\(res.map { "\($0.key):\($0.value.busy ? "BUSY" : "idle")/\($0.value.nodes)n\($0.value.complete ? "" : "~")" }.sorted()) usable=\(axUsable.sorted()) busy=\(axBusy.sorted())\(held)\(why)")
+        }
         publish(now: now)
     }
 
@@ -328,7 +418,7 @@ final class StatusMonitor {
                 let at = doneAt[t.id] ?? now
                 if doneAt[t.id] == nil { doneAt[t.id] = at }
                 if front == t.path, now.timeIntervalSince(at) >= doneLinger {
-                    autoDone.remove(t.id); removeFile(t)
+                    autoDone.remove(t.id); axOwed.remove(t.id); removeFile(t)
                     doneAt[t.id] = nil
                     s = .idle
                 }

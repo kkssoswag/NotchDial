@@ -535,11 +535,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for _ in 0..<5 { atick(true, nodes: 90) }
         atick(false, nodes: 90)
         results.append(axm.states[0] == .done ? "PASS 状态·AX收工→出章" : "FAIL 状态·AX收工→出章")
+        axm.clearDone(kTargets[0])   // nothing pending: a bare flicker must mint nothing
         atick(true, nodes: 90); atick(false, nodes: 90, step: 1)
         results.append(axm.states[0] == nil ? "PASS 状态·AX瞬时抖动不出章" : "FAIL 状态·AX瞬时抖动不出章")
         // a genuinely short turn still earns its stamp — AX is exact, not a guess
         atick(true, nodes: 90); atick(true, nodes: 90); atick(false, nodes: 90)
         results.append(axm.states[0] == .done ? "PASS 状态·AX短回合也盖章" : "FAIL 状态·AX短回合也盖章")
+        // Measured at a real turn boundary (03:00:24 done → 03:00:25 BUSY/209n →
+        // 03:00:26 idle): one spurious sweep used to wipe a stamp nobody had seen
+        // yet, because the burst was too short to mint a replacement. The spinner
+        // may cover the ✓ while it lasts, but the ✓ has to come back.
+        axm.clearDone(kTargets[0])
+        for _ in 0..<5 { atick(true, nodes: 90) }
+        atick(false, nodes: 90)
+        atick(true, nodes: 209, step: 1)
+        let hidden = axm.states[0] == .working
+        atick(false, nodes: 219, step: 1)
+        results.append(hidden && axm.states[0] == .done ? "PASS 状态·抖动不抹掉未看的章" : "FAIL 状态·抖动不抹掉未看的章")
+
+        // ---- three-valued reading: busy / finished / UNKNOWN -------------------
+        // The bug this pins: an Electron AX tree comes back partial while the app
+        // re-renders, and a partial tree that fails to find the row was being read
+        // as "the agent stopped". Absence of evidence is not evidence of absence.
+        let vm = StatusMonitor()
+        vm.dirPath = NSTemporaryDirectory() + "nd-verdict-selftest-\(ProcessInfo.processInfo.processIdentifier)"
+        vm.hbEnabled = false
+        vm.frontmostBundlePath = { "/nonexistent" }
+        var vNow = Date(timeIntervalSince1970: 5_000_000)
+        func vtick(_ r: StatusMonitor.AXRead, _ step: TimeInterval = 1) {
+            vNow = vNow.addingTimeInterval(step)
+            vm.applyAX([0: r], now: vNow)
+        }
+        let sess = "可用工具检查"
+        vtick(.init(nodes: 90, running: [sess]))
+        results.append(vm.states[0] == .working ? "PASS 状态·会话行在跑→工作中" : "FAIL 状态·会话行在跑→工作中")
+        // the tree loses the row mid-turn (exactly what the log showed at 03:04:21)
+        for _ in 0..<6 { vtick(.init(nodes: 219, complete: false)) }
+        results.append(vm.states[0] == .working ? "PASS 状态·残缺树不判收工" : "FAIL 状态·残缺树不判收工")
+        // even a COMPLETE tree that simply lacks the row proves nothing about it
+        for _ in 0..<6 { vtick(.init(nodes: 219, settled: ["别的会话"])) }
+        results.append(vm.states[0] == .working ? "PASS 状态·别的会话收工不算数" : "FAIL 状态·别的会话收工不算数")
+        // only the row's own finished face settles it
+        vtick(.init(nodes: 219, settled: [sess]))
+        results.append(vm.states[0] == .done ? "PASS 状态·本会话收工→盖章" : "FAIL 状态·本会话收工→盖章")
+        // and holding "working" cannot last forever if the row never returns
+        let wm = StatusMonitor()
+        wm.dirPath = NSTemporaryDirectory() + "nd-watchdog-selftest-\(ProcessInfo.processInfo.processIdentifier)"
+        wm.hbEnabled = false
+        wm.axUnknownGrace = 10
+        wm.frontmostBundlePath = { "/nonexistent" }
+        var wNow = Date(timeIntervalSince1970: 6_000_000)
+        func wtick(_ r: StatusMonitor.AXRead, _ step: TimeInterval = 1) {
+            wNow = wNow.addingTimeInterval(step)
+            wm.applyAX([0: r], now: wNow)
+        }
+        wtick(.init(nodes: 90, running: [sess]))
+        for _ in 0..<5 { wtick(.init(nodes: 219, complete: false)) }
+        let stillHeld = wm.states[0] == .working
+        for _ in 0..<8 { wtick(.init(nodes: 219, complete: false)) }
+        results.append(stillHeld && wm.states[0] != .working ? "PASS 状态·未知超时看守生效" : "FAIL 状态·未知超时看守生效")
         // a stamp must stay on screen long enough to be seen, even if you never left
         let lm = StatusMonitor()
         lm.dirPath = NSTemporaryDirectory() + "nd-linger-selftest-\(ProcessInfo.processInfo.processIdentifier)"
@@ -600,7 +654,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for t in kTargets {
             if let pid = AXStatus.pid(for: t) {
                 _ = AXStatus.enableWebTree(pid: pid, force: true)
-                print("AX \(t.name): pid \(pid) — 已请求网页 AX 树")
+                // -25204 apiDisabled / -25211 notImplemented → macOS is refusing us,
+                // which is a very different problem from an app with a bare tree.
+                print("AX \(t.name): pid \(pid) — 已请求网页 AX 树  \(AXStatus.rootReport(pid: pid))")
             } else {
                 print("AX \(t.name): 未运行")
             }

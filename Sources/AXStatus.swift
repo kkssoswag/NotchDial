@@ -17,7 +17,10 @@ enum AXStatus {
     private static let kRole = "AXRole" as CFString
     private static let kChildren = "AXChildren" as CFString
     private static let kWindows = "AXWindows" as CFString
-    private static let labelAttrs = ["AXTitle", "AXDescription", "AXHelp", "AXIdentifier", "AXValue"]
+    // Every attribute here costs one synchronous IPC round-trip per node per sweep.
+    // Measured on the real apps, only these two ever carry a status label; reading
+    // the other three tripled the traffic for nothing.
+    private static let labelAttrs = ["AXTitle", "AXDescription"]
 
     /// Label PREFIXES that mean "this agent is currently producing something".
     /// Prefix rather than substring on purpose: Claude's sidebar labels a live
@@ -26,6 +29,23 @@ enum AXStatus {
     static var busyPrefixes = ["running", "stop", "停止", "中断", "interrupt", "cancel generation", "generating", "thinking"]
     /// Prefixes that look busy but aren't the agent working.
     static var ignorePrefixes = ["stop sharing", "stop recording", "stop screen"]
+
+    /// The two faces of one sidebar row. Claude labels a session row "Running <name>"
+    /// while it is live and "Mark as unread <name>" when it is not — so the row is a
+    /// *two-sided* signal, and that is what makes it trustworthy: "Mark as unread X"
+    /// is positive evidence that X finished, which a mere absence of "Running X" is
+    /// not. The AX tree of an Electron app comes back partial while it re-renders,
+    /// and a partial tree must never be read as "the agent stopped".
+    static var runPrefix = "running "
+    static var settledPrefix = "mark as unread "
+
+    /// The name a session row carries, if the label is one of the two known forms.
+    static func sessionName(_ s: String, prefix: String) -> String? {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard t.lowercased().hasPrefix(prefix) else { return nil }
+        let name = String(t.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
 
     static var maxNodes = 2600
     static var maxDepth = 26
@@ -59,10 +79,30 @@ enum AXStatus {
     }
 
     // MARK: element helpers
+    /// Last error from the root read, so an empty tree can name its own cause:
+    /// a real denial (-25204/-25211) looks nothing like a genuinely bare app.
+    static var lastRootError: AXError = .success
+
     private static func copy(_ el: AXUIElement, _ attr: CFString) -> CFTypeRef? {
         var v: CFTypeRef?
         guard AXUIElementCopyAttributeValue(el, attr, &v) == .success else { return nil }
         return v
+    }
+
+    /// Why is this app's tree empty? Three very different answers look identical
+    /// from a node count of zero: macOS refusing us, the app exposing nothing, and
+    /// the app simply having no open windows.
+    static func rootReport(pid: pid_t) -> String {
+        let app = AXUIElementCreateApplication(pid)
+        var wins: CFTypeRef?
+        let e = AXUIElementCopyAttributeValue(app, kWindows, &wins)
+        var roleV: CFTypeRef?
+        let re = AXUIElementCopyAttributeValue(app, kRole, &roleV)
+        var names: CFArray?
+        AXUIElementCopyAttributeNames(app, &names)
+        let attrs = (names as? [String]) ?? []
+        let w = (wins as? [AXUIElement])?.count ?? -1
+        return "role=\(roleV as? String ?? "?")/\(re.rawValue) windows=\(w)/\(e.rawValue) attrs=\(attrs.count) manualAX=\(attrs.contains("AXManualAccessibility"))"
     }
     private static func string(_ el: AXUIElement, _ attr: String) -> String? {
         copy(el, attr as CFString) as? String
@@ -95,45 +135,114 @@ enum AXStatus {
     }
 
     struct Probe {
-        var busy = false
+        var busy = false          // a stop/interrupt control is on screen
         var nodes = 0
         var ms = 0
         var hit = ""
+        var running: [String] = []   // sessions the sidebar says are live
+        var settled: [String] = []   // sessions the sidebar says are NOT live
+        /// False when the walk stopped on a budget rather than running out of tree.
+        /// A truncated walk can only ever prove "busy" — never "idle".
+        var complete = true
     }
 
     /// Breadth-first scan of one app's AX tree for a stop/interrupt control.
     /// Buttons live near the composer, which is deep but not enormous; the node
     /// budget keeps a pathological tree from ever stalling the poll.
+    /// The one sidebar row worth watching, kept between sweeps.
+    ///
+    /// This is the difference between a status indicator and a denial-of-service on
+    /// the app you are indicating. A full walk is thousands of synchronous IPC calls;
+    /// running one every second made all three Electron apps stop reporting their
+    /// windows entirely (measured: `windows=0` while NotchDial polled, `windows=1`
+    /// the moment it was killed). Once the row has been found, re-reading that single
+    /// element is two calls, and it answers the whole question — the row itself flips
+    /// between "Running <name>" and "Mark as unread <name>".
+    private static var rowCache: [pid_t: AXUIElement] = [:]
+    private static var lastFull: [pid_t: Date] = [:]
+    /// Floor between full walks. The cached row carries the signal at 1 Hz; walking
+    /// is only for (re)finding it, and must stay rare enough to be harmless.
+    static var fullScanEvery: TimeInterval = 4
+    static func forgetRows() { rowCache = [:]; lastFull = [:] }
+
+    /// Read the cached row, if it still exists and still says something we know.
+    private static func readCachedRow(_ pid: pid_t) -> Probe? {
+        guard let el = rowCache[pid] else { return nil }
+        for a in labelAttrs {
+            guard let s = string(el, a), !s.isEmpty else { continue }
+            if let n = sessionName(s, prefix: runPrefix) {
+                return Probe(busy: true, nodes: 1, ms: 0, hit: "cached \(a)=\(s)", running: [n], settled: [], complete: true)
+            }
+            if let n = sessionName(s, prefix: settledPrefix) {
+                return Probe(busy: false, nodes: 1, ms: 0, hit: "", running: [], settled: [n], complete: true)
+            }
+        }
+        rowCache[pid] = nil          // re-rendered away; the next walk will find it again
+        return nil
+    }
+
     static func probe(pid: pid_t) -> Probe {
-        var p = Probe()
         let t0 = Date()
+        if var c = readCachedRow(pid) {
+            c.ms = Int(Date().timeIntervalSince(t0) * 1000)
+            return c
+        }
+        if let last = lastFull[pid], Date().timeIntervalSince(last) < fullScanEvery {
+            // Not allowed to walk yet, and nothing cached: say so honestly rather
+            // than reporting an idle we did not actually observe.
+            return Probe(busy: false, nodes: 0, ms: 0, hit: "", running: [], settled: [], complete: false)
+        }
+        lastFull[pid] = Date()
+        var p = Probe()
         let app = AXUIElementCreateApplication(pid)
         var level: [AXUIElement] = copy(app, kWindows) as? [AXUIElement] ?? kids(app)
         var depth = 0
+        // Walking the whole tree and reading five attributes per node is thousands of
+        // synchronous IPC calls into an Electron app — once a second, forever, that is
+        // enough to hurt the app we are watching. So: stop at the first row that says
+        // "live", which is the common case while an agent works. Only when nothing is
+        // live do we pay for the full walk, and that is exactly when we need it —
+        // the finished label ("Mark as unread <name>") is the evidence that a session
+        // really stopped, and an idle app is cheap to read.
         outer: while !level.isEmpty, depth < maxDepth, p.nodes < maxNodes {
             var next: [AXUIElement] = []
             for el in level {
                 p.nodes += 1
-                if p.nodes >= maxNodes { break outer }
+                if p.nodes >= maxNodes { p.complete = false; break }
                 let r = role(el)
                 if r == "AXButton" || r == "AXRadioButton" || r == "AXMenuButton" || r == "AXImage" || r == "AXStaticText" {
-                    if let hit = matches(el) {
-                        p.busy = true
-                        p.hit = "\(r) \(hit)"
-                        break outer
+                    for a in labelAttrs {
+                        guard let s = string(el, a), !s.isEmpty, s.count < 90 else { continue }
+                        if let n = sessionName(s, prefix: runPrefix) {
+                            p.running.append(n)
+                            p.busy = true
+                            if p.hit.isEmpty { p.hit = "\(r) \(a)=\(s)" }
+                            // Remember the row itself. It is the same element that will
+                            // later read "Mark as unread <name>", so from here on the
+                            // whole signal costs two IPC calls instead of a walk.
+                            rowCache[pid] = el
+                            break outer
+                        }
+                        if let n = sessionName(s, prefix: settledPrefix) { p.settled.append(n); break }
+                        if labelIsBusy(s) {
+                            p.busy = true
+                            if p.hit.isEmpty { p.hit = "\(r) \(a)=\(s)" }
+                            break
+                        }
                     }
                 }
                 // a live progress spinner in the app's own UI is just as truthful
                 if r == "AXProgressIndicator" || r == "AXBusyIndicator" {
                     p.busy = true
-                    p.hit = r
-                    break outer
+                    if p.hit.isEmpty { p.hit = r }
                 }
                 next.append(contentsOf: kids(el))
             }
+            if !p.complete { break }
             level = next
             depth += 1
         }
+        if !level.isEmpty && depth >= maxDepth { p.complete = false }
         p.ms = Int(Date().timeIntervalSince(t0) * 1000)
         return p
     }
