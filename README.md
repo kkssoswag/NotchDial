@@ -38,28 +38,37 @@ boundaries as ground truth:
 The idle column is *higher*. Any threshold you pick on those numbers is a coin flip.
 So NotchDial reads the truth instead, in this order:
 
-1. **The app's own UI, via the Accessibility API (authoritative).** While a session
-   is live, Claude's sidebar labels it `Running <name>`; Cursor and Codex show a
-   stop/interrupt control. That label is the same thing you see on screen, per
-   session, and it is correct for cloud and local runs alike. One catch: Chromium
-   keeps its web accessibility tree switched off until an assistive client opts in,
-   so NotchDial writes `AXManualAccessibility` on the app first.
+1. **The composer's interrupt control (authoritative, turn-level).** This is the
+   one thing in the UI whose meaning is exactly "a turn is in progress", and the
+   reason is definitional: a turn is interruptible for precisely as long as it
+   lasts, so the stop control exists for precisely that long.
 
-   The trick is to watch the rows rather than sample the tree. A sidebar row is
-   *two-sided* — "Running <name>" while live, "Mark as unread <name>" when not — so
-   once located it answers for its own session: 2 IPC calls per session per second
-   instead of a full walk, and no false "idle" when the tree comes back partial
-   under load (it does, constantly). **Every** session row is watched, not just the
-   first: one app runs several agents at once, and stopping at the first live row
-   meant whichever session finished first stamped ✓ for the whole app while the
-   others were still going. Walking every second is not a neutral
-   act, either: it made all three Electron apps stop reporting their windows at all,
-   for ~18 s. Reads are three-valued — working / finished / **unknown** — and unknown
-   holds the previous state instead of inventing an idle.
+   The obvious-looking signal is the wrong one, and it took a while to see why.
+   Claude's sidebar labels a live session `Running <name>` — but that tracks the
+   model *emitting tokens*, so it drops out for the entire thirty seconds a tool
+   call takes and comes back after. Read that, and a single turn reports
+   working → done → working → done → working → done. No amount of better reading
+   fixes it; the quantity itself is not the one you want. Measured, same session,
+   same minute: six state changes in 30 s before, one in 90 s after.
+
+   `AXWebArea`'s title (`<session> - Claude`) says which session the control
+   belongs to, so the composer speaks only for the session on screen. Background
+   sessions still use the sidebar label — a background session inside a tool call
+   is the one case nothing local can currently see.
+
+   Two practical notes, both learned the hard way. Chromium keeps its web
+   accessibility tree off until an assistive client opts in (`AXManualAccessibility`),
+   and it switches the tree back **off** again when it decides nobody is listening —
+   so the opt-in has to be re-asserted, with backoff, or the signal dies silently
+   and never returns. And walking that tree is not free: a full walk every second
+   made all three Electron apps stop reporting their windows at all. NotchDial
+   locates the rows and the composer once, then re-reads those elements for a
+   couple of IPC calls each (measured: 6 nodes, ~1 ms per sweep), and re-walks only
+   to discover something new.
 
    Needs a one-time grant: **menu bar → 精确状态**, or System Settings › Privacy &
-   Security › Accessibility › NotchDial. Nothing else to configure, ever — see
-   **Keeping the permission** below if you build from source often.
+   Security › Accessibility › NotchDial. See **Keeping the permission** below if you
+   build from source often.
 
 2. **Hooks (exact — the agent tells you).** For **local** Claude Code sessions this
    beats everything above, because nothing you can observe from outside is as good as

@@ -108,14 +108,19 @@ final class StatusMonitor {
 
     /// Fold one sweep's session evidence into the per-session view.
     private func applySessions(_ id: Int, _ r: AXRead, now: Date) {
-        guard !r.running.isEmpty || !r.settled.isEmpty else { return }
+        guard !r.running.isEmpty || !r.settled.isEmpty || (r.openChecked && r.openSession != nil) else { return }
         var st = sessState[id] ?? [:]
         var sn = sessSince[id] ?? [:]
-        let running = Set(r.running)
+        var running = Set(r.sidebarRunning(excluding: r.openSession))
+        var settledNames = r.settled
+        if let open = r.openSession, r.openChecked {
+            if r.openBusy { running.insert(open); settledNames.removeAll { $0 == open } }
+            else { running.remove(open); if !settledNames.contains(open) { settledNames.append(open) } }
+        }
         for n in running where st[n] != .working {
             st[n] = .working; sn[n] = now
         }
-        for n in r.settled {
+        for n in settledNames {
             // Only a session we watched working earns a stamp; a row that was already
             // finished when we first saw it is just part of the furniture.
             if st[n] == .working {
@@ -147,9 +152,21 @@ final class StatusMonitor {
         var running: [String] = []
         var settled: [String] = []
         var complete = true
-        init(busy: Bool = false, nodes: Int = 0, running: [String] = [], settled: [String] = [], complete: Bool = true) {
+        var openSession: String?
+        var openBusy = false
+        var openChecked = false
+        init(busy: Bool = false, nodes: Int = 0, running: [String] = [], settled: [String] = [],
+             complete: Bool = true, openSession: String? = nil, openBusy: Bool = false,
+             openChecked: Bool = false) {
             self.busy = busy; self.nodes = nodes
             self.running = running; self.settled = settled; self.complete = complete
+            self.openSession = openSession; self.openBusy = openBusy; self.openChecked = openChecked
+        }
+        /// The sidebar's word on the visible session, which we deliberately ignore
+        /// when the composer has told us something better.
+        func sidebarRunning(excluding open: String?) -> [String] {
+            guard let open = open, openChecked else { return running }
+            return running.filter { $0 != open }
         }
     }
 
@@ -181,9 +198,13 @@ final class StatusMonitor {
     /// window. That never belongs in a log by default, and it certainly never
     /// belonged in world-readable /tmp. Opt in explicitly to see the text.
     static let logLabels = UserDefaults.standard.bool(forKey: "statusDebugLabels")
+    /// Keep the shape, drop the content. Which rule fired and on what kind of element
+    /// is the whole diagnostic value; the text after the `=` is the user's chat title
+    /// and is none of the log's business.
     static func redact(_ s: String) -> String {
         guard !logLabels, !s.isEmpty else { return s }
-        return "‹\(s.count) chars›"
+        guard let eq = s.firstIndex(of: "=") else { return "‹\(s.count)›" }
+        return String(s[s.startIndex...eq]) + "‹\(s.distance(from: s.index(after: eq), to: s.endIndex))›"
     }
     private static let stamper: ISO8601DateFormatter = ISO8601DateFormatter()
     private static let logDir = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/NotchDial")
@@ -426,7 +447,9 @@ final class StatusMonitor {
                 }
                 let p = AXStatus.probe(pid: pid)
                 out[id] = AXRead(busy: p.busy, nodes: p.nodes,
-                                 running: p.running, settled: p.settled, complete: p.complete)
+                                 running: p.running, settled: p.settled, complete: p.complete,
+                                 openSession: p.openSession, openBusy: p.openBusy,
+                                 openChecked: p.openChecked)
                 if p.busy { hits[id] = p.hit }
             }
             DispatchQueue.main.async {
@@ -447,9 +470,23 @@ final class StatusMonitor {
     /// Weigh one sweep's evidence for one app. The whole point is the third answer:
     /// a sweep that simply failed to find the row must not be allowed to say "idle".
     func verdict(_ id: Int, _ r: AXRead) -> AXVerdict {
-        if !r.running.isEmpty {                       // the row says live — done deal
-            axLive[id] = Set(r.running)
+        // The interrupt control is the only turn-level thing in the tree: it exists
+        // for exactly as long as the turn does, because a turn is by definition
+        // interruptible. The sidebar's "Running <name>" only tracks token emission,
+        // so it drops out for the length of every tool call. Where the two disagree
+        // about the visible session, the composer wins.
+        var live = Set(r.sidebarRunning(excluding: r.openSession))
+        if let open = r.openSession, r.openChecked {
+            if r.openBusy { live.insert(open) } else { live.remove(open) }
+        }
+        if !live.isEmpty {
+            axLive[id] = live
             return .working
+        }
+        if r.openChecked, let open = r.openSession, !r.openBusy,
+           axLive[id]?.contains(open) == true, (axLive[id]?.count ?? 0) == 1 {
+            axLive[id] = []                            // the visible turn ended, for certain
+            return .finished
         }
         if let live = axLive[id], !live.isEmpty {
             // We know exactly which rows to look for. Only their *finished* labels
@@ -512,9 +549,15 @@ final class StatusMonitor {
             // the hit string is what makes a spurious BUSY identifiable after the fact —
             // without it every flicker in the log is indistinguishable from a real turn
             let why = hits.isEmpty ? "" : " hit=\(hits.map { "\($0.key):\(Self.redact($0.value))" }.sorted())"
+            // which signal actually decided this sweep — sidebar or composer
+            let op = res.compactMap { (k, v) -> String? in
+                guard v.openChecked || v.openSession != nil else { return nil }
+                return "\(k):\(v.openChecked ? (v.openBusy ? "STOP" : "idle") : "unchecked")/\(v.openSession == nil ? "?" : "named")"
+            }.sorted()
+            let opened = op.isEmpty ? " open=none" : " open=\(op)"
             let live = axLive.filter { !$0.value.isEmpty }
             let held = live.isEmpty ? "" : " live=\(live.map { "\($0.key):\(Self.redact($0.value.sorted().joined(separator: "|")))" }.sorted())"
-            log("AX res=\(res.map { "\($0.key):\($0.value.busy ? "BUSY" : "idle")/\($0.value.nodes)n\($0.value.complete ? "" : "~")" }.sorted()) usable=\(axUsable.sorted()) busy=\(axBusy.sorted())\(held)\(why)")
+            log("AX res=\(res.map { "\($0.key):\($0.value.busy ? "BUSY" : "idle")/\($0.value.nodes)n\($0.value.complete ? "" : "~")" }.sorted()) usable=\(axUsable.sorted()) busy=\(axBusy.sorted())\(opened)\(held)\(why)")
         }
         rebuildSessions()
         publish(now: now)

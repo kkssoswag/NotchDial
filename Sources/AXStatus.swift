@@ -84,7 +84,8 @@ enum AXStatus {
     static func forget(pid: pid_t) {
         lock.lock()
         activated.remove(pid); rowCache[pid] = nil; scopeCache[pid] = nil
-        lastFull[pid] = nil; lastDiscover[pid] = nil
+        composerCache[pid] = nil; webAreaCache[pid] = nil
+        lastFull[pid] = nil; lastDiscover[pid] = nil; emptyStreak[pid] = nil
         lock.unlock()
     }
     static func forgetActivation(pid: pid_t) { forget(pid: pid) }
@@ -164,6 +165,36 @@ enum AXStatus {
         /// False when the walk stopped on a budget rather than running out of tree.
         /// A truncated walk can only ever prove "busy" — never "idle".
         var complete = true
+        /// The session the window is currently showing, from the web area's title.
+        var openSession: String?
+        /// Whether that session is inside a turn — see `stopPrefixes`.
+        var openBusy = false
+        /// Whether this sweep was actually able to look for the stop control. An
+        /// unchecked composer is not the same as an absent stop button.
+        var openChecked = false
+    }
+
+    /// The composer's interrupt control. THIS is the turn-level signal, and the
+    /// reason the sidebar label was never going to work: "Running <name>" tracks the
+    /// model *emitting tokens*, so it goes quiet for the thirty seconds a tool call
+    /// takes and the status flickers several times per turn. You can interrupt a turn
+    /// at any point of it, including mid-tool — so the interrupt control is present
+    /// for exactly as long as the turn is, which is the quantity we actually want.
+    static var stopPrefixes = ["stop response", "stop generating", "stop streaming",
+                               "停止响应", "停止生成", "停止", "中断", "interrupt", "cancel generation"]
+    static func labelIsStop(_ s: String) -> Bool {
+        let low = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ignorePrefixes.contains(where: { low.hasPrefix($0) }) { return false }
+        return stopPrefixes.contains(where: { low.hasPrefix($0) })
+    }
+
+    /// "可用工具检查 - Claude" → "可用工具检查". The window title names the session the
+    /// stop control belongs to, which is what lets one app's several sessions be told
+    /// apart by a control that only ever exists for the visible one.
+    static func openSessionName(_ title: String) -> String? {
+        guard let r = title.range(of: " - ", options: .backwards) else { return nil }
+        let n = String(title[title.startIndex..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
+        return n.isEmpty ? nil : n
     }
 
     /// Breadth-first scan of one app's AX tree for a stop/interrupt control.
@@ -192,12 +223,27 @@ enum AXStatus {
     /// re-rendered away, re-finding it inside this subtree costs a few dozen nodes
     /// instead of a walk across the whole window.
     private static var scopeCache: [pid_t: AXUIElement] = [:]
+    /// The composer subtree, so the interrupt control can be re-checked for a few
+    /// dozen nodes instead of a walk. The button itself cannot be cached — it does
+    /// not exist between turns, which is the whole point of it.
+    private static var composerCache: [pid_t: AXUIElement] = [:]
+    private static var webAreaCache: [pid_t: AXUIElement] = [:]
     private static var lastFull: [pid_t: Date] = [:]
     /// Floor between full walks. The cached row carries the signal at 1 Hz; walking
     /// is only for (re)finding it, and must stay rare enough to be harmless.
     static var fullScanEvery: TimeInterval = 4
-    static func forgetRows() { rowCache = [:]; scopeCache = [:]; lastFull = [:]; lastDiscover = [:] }
+    static func forgetRows() {
+        rowCache = [:]; scopeCache = [:]; composerCache = [:]; webAreaCache = [:]
+        lastFull = [:]; lastDiscover = [:]; emptyStreak = [:]
+    }
     private static var lastDiscover: [pid_t: Date] = [:]
+    /// Consecutive walks that came back with nothing at all. Chromium switches its
+    /// accessibility tree back OFF when it decides no assistive client is listening,
+    /// and our opt-in was once-per-pid — so once it went dark it stayed dark, and the
+    /// indicator was silent until the app or NotchDial restarted. Re-assert the
+    /// opt-in, and back off while doing it: hammering an app that is not answering is
+    /// also how it got there.
+    private static var emptyStreak: [pid_t: Int] = [:]
     /// How often to go looking for sessions we have never seen. Known rows are read
     /// every sweep, so this only has to catch a brand-new chat.
     static var discoverEvery: TimeInterval = 12
@@ -265,10 +311,12 @@ enum AXStatus {
                 let w = walk(from: roots, pid: pid, budget: maxNodes)
                 if w.complete, !(w.running.isEmpty && w.settled.isEmpty) {
                     var m = w
+                    m.openChecked = true
                     m.ms = Int(Date().timeIntervalSince(t0) * 1000)
                     return m
                 }
             }
+            readOpen(pid, into: &c)
             c.ms = Int(Date().timeIntervalSince(t0) * 1000)
             return c
         }
@@ -284,17 +332,43 @@ enum AXStatus {
             }
             lock.lock(); scopeCache[pid] = nil; lock.unlock()
         }
-        if let last = last, Date().timeIntervalSince(last) < fullScanEvery {
+        lock.lock(); let streak = emptyStreak[pid] ?? 0; lock.unlock()
+        let backoff = min(fullScanEvery * pow(2, Double(min(streak, 4))), 60)
+        if let last = last, Date().timeIntervalSince(last) < backoff {
             // Not allowed to walk yet, and nothing cached: say so honestly rather
             // than reporting an idle we did not actually observe.
             return Probe(busy: false, nodes: 0, ms: 0, hit: "", running: [], settled: [], complete: false)
         }
         lock.lock(); lastFull[pid] = Date(); lock.unlock()
+        if streak > 0 { _ = enableWebTree(pid: pid, force: true) }   // ask again; it may have hung up
         let roots: [AXUIElement] = copy(AXUIElementCreateApplication(pid), kWindows) as? [AXUIElement]
             ?? kids(AXUIElementCreateApplication(pid))
         var p = walk(from: roots, pid: pid, budget: maxNodes)
+        lock.lock(); emptyStreak[pid] = p.nodes < 8 ? streak + 1 : 0; lock.unlock()
+        // A walk that saw nothing cannot report on the composer either.
+        p.openChecked = p.nodes >= 8
         p.ms = Int(Date().timeIntervalSince(t0) * 1000)
         return p
+    }
+
+    /// Re-check just the composer and the window title: which session is on screen,
+    /// and is it inside a turn. Tens of nodes, and it is the authoritative answer for
+    /// the session the user is actually looking at.
+    private static func readOpen(_ pid: pid_t, into p: inout Probe) {
+        lock.lock(); let wa = webAreaCache[pid]; let comp = composerCache[pid]; lock.unlock()
+        if let wa = wa, let t = string(wa, "AXTitle"), let n = openSessionName(t) {
+            p.openSession = n
+        } else if wa != nil {
+            lock.lock(); webAreaCache[pid] = nil; lock.unlock()
+        }
+        guard let comp = comp else { return }
+        let scan = walk(from: [comp], pid: pid, budget: 260)
+        guard scan.nodes > 0 else {
+            lock.lock(); composerCache[pid] = nil; lock.unlock()
+            return
+        }
+        p.openChecked = true
+        if scan.openBusy { p.openBusy = true; p.busy = true; if p.hit.isEmpty { p.hit = scan.hit } }
     }
 
     /// Keep the row element, and the list it hangs in. Watching a row that is merely
@@ -327,6 +401,11 @@ enum AXStatus {
                 p.nodes += 1
                 if p.nodes >= budget { p.complete = false; break }
                 let r = role(el)
+                if r == "AXWebArea", p.openSession == nil, let t = string(el, "AXTitle"),
+                   let n = openSessionName(t) {
+                    p.openSession = n
+                    lock.lock(); webAreaCache[pid] = el; lock.unlock()
+                }
                 if r == "AXButton" || r == "AXRadioButton" || r == "AXMenuButton" || r == "AXImage" || r == "AXStaticText" {
                     for a in labelAttrs {
                         guard let s = string(el, a), !s.isEmpty, s.count < 90 else { continue }
@@ -340,6 +419,13 @@ enum AXStatus {
                         if let n = sessionName(s, prefix: settledPrefix) {
                             p.settled.append(n)
                             remember(pid: pid, name: n, el: el)
+                            break
+                        }
+                        if labelIsStop(s) {
+                            p.openBusy = true; p.busy = true
+                            if p.hit.isEmpty { p.hit = "STOP \(r) \(a)=\(s)" }
+                            let anc = ancestor(el, up: 3)
+                            lock.lock(); composerCache[pid] = anc; lock.unlock()
                             break
                         }
                         if labelIsBusy(s) {

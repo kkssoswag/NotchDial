@@ -717,6 +717,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         put("s2", "done")
         fNow = fNow.addingTimeInterval(1); fm2.tick(cpuSample: [:], now: fNow)
         results.append(fm2.states[0] == .done ? "PASS 多会话·文件全收工才盖章" : "FAIL 多会话·文件全收工才盖章")
+        // THE root cause, pinned. "Running <name>" tracks token emission, so it drops
+        // out for the whole length of a tool call and the status flickers several
+        // times per turn. The interrupt control does not: a turn is interruptible for
+        // exactly as long as it lasts. Where they disagree about the visible session,
+        // the composer wins.
+        let om = StatusMonitor()
+        om.dirPath = NSTemporaryDirectory() + "nd-open-selftest-\(ProcessInfo.processInfo.processIdentifier)"
+        om.hbEnabled = false
+        om.frontmostBundlePath = { "/nonexistent" }
+        var oNow = Date(timeIntervalSince1970: 11_000_000)
+        func otick(_ r: StatusMonitor.AXRead, _ step: TimeInterval = 1) {
+            oNow = oNow.addingTimeInterval(step); om.applyAX([0: r], now: oNow)
+        }
+        let open = "可用工具检查"
+        otick(.init(nodes: 90, running: [open], openSession: open, openBusy: true, openChecked: true))
+        otick(.init(nodes: 90, running: [open], openSession: open, openBusy: true, openChecked: true))
+        // mid-turn tool call: the sidebar goes quiet, the stop button does not
+        otick(.init(nodes: 90, running: [], settled: [open], openSession: open, openBusy: true, openChecked: true))
+        otick(.init(nodes: 90, running: [], settled: [open], openSession: open, openBusy: true, openChecked: true))
+        results.append(om.states[0] == .working
+            ? "PASS 回合·工具调用中不算收工" : "FAIL 回合·工具调用中不算收工")
+        // the turn really ends: the interrupt control goes away
+        otick(.init(nodes: 90, running: [], settled: [open], openSession: open, openBusy: false, openChecked: true))
+        results.append(om.states[0] == .done ? "PASS 回合·停止键消失才收工" : "FAIL 回合·停止键消失才收工")
+        // a background session the composer cannot speak for still uses the sidebar
+        om.clearDone(kTargets[0])
+        let bg = "后台会话"
+        otick(.init(nodes: 90, running: [bg], settled: [open], openSession: open, openBusy: false, openChecked: true))
+        results.append(om.states[0] == .working ? "PASS 回合·后台会话仍看侧边栏" : "FAIL 回合·后台会话仍看侧边栏")
         try? FileManager.default.removeItem(atPath: fm2.dirPath)
         // a stamp must stay on screen long enough to be seen, even if you never left
         let lm = StatusMonitor()
