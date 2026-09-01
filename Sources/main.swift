@@ -134,10 +134,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // event-driven running indicators (no polling)
         let wnc = NSWorkspace.shared.notificationCenter
         wnc.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            RunningApps.invalidate()
             self?.refreshRunning(force: true)
         }
-        wnc.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.refreshRunning(force: true)
+        wnc.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] n in
+            let gone = (n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)
+            let pid = gone?.processIdentifier
+            let path = gone?.bundleURL?.path
+            RunningApps.invalidate()
+            guard let self = self else { return }
+            // Everything AX believes about this app is now about a process that does
+            // not exist — including the pid, which macOS will hand to someone else.
+            if let p = pid { AXStatus.forget(pid: p) }
+            for t in kTargets where t.path == path { self.statusMon.targetTerminated(t.id, pid: pid) }
+            self.refreshRunning(force: true)
         }
         if CommandLine.arguments.contains("--dumpplanets") {
             for (i, cg) in SpaceAssets.planets.enumerated() {
@@ -633,6 +643,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let stillHeld = wm.states[0] == .working
         for _ in 0..<8 { wtick(.init(nodes: 219, complete: false)) }
         results.append(stillHeld && wm.states[0] != .working ? "PASS 状态·未知超时看守生效" : "FAIL 状态·未知超时看守生效")
+        // An app that quits never appears in another sweep, so nothing could ever
+        // clear its spinner — the notch kept asserting a process that was gone.
+        let qm = StatusMonitor()
+        qm.dirPath = NSTemporaryDirectory() + "nd-quit-selftest-\(ProcessInfo.processInfo.processIdentifier)"
+        qm.hbEnabled = false
+        qm.frontmostBundlePath = { "/nonexistent" }
+        var qNow = Date(timeIntervalSince1970: 7_000_000)
+        qNow = qNow.addingTimeInterval(1)
+        qm.applyAX([0: .init(nodes: 90, running: [sess])], now: qNow)
+        let wasWorking = qm.states[0] == .working
+        qm.targetTerminated(0, pid: nil)
+        results.append(wasWorking && qm.states[0] == nil ? "PASS 状态·退出即清除" : "FAIL 状态·退出即清除")
+        // Losing the grant must release AX's exclusive claim, or the fallbacks it
+        // suppresses stay suppressed and the last reading is frozen in place.
+        let tm2 = StatusMonitor()
+        tm2.dirPath = NSTemporaryDirectory() + "nd-trust-selftest-\(ProcessInfo.processInfo.processIdentifier)"
+        tm2.hbEnabled = false
+        tm2.frontmostBundlePath = { "/nonexistent" }
+        var tNow = Date(timeIntervalSince1970: 8_000_000)
+        tNow = tNow.addingTimeInterval(1)
+        tm2.applyAX([0: .init(nodes: 90, running: [sess])], now: tNow)
+        let heldBefore = tm2.states[0] == .working
+        tm2.forgetAX(0)
+        tm2.applyAX([Int: StatusMonitor.AXRead](), now: tNow.addingTimeInterval(1))
+        results.append(heldBefore && tm2.states[0] == nil ? "PASS 状态·失去授权即释放" : "FAIL 状态·失去授权即释放")
         // a stamp must stay on screen long enough to be seen, even if you never left
         let lm = StatusMonitor()
         lm.dirPath = NSTemporaryDirectory() + "nd-linger-selftest-\(ProcessInfo.processInfo.processIdentifier)"

@@ -73,6 +73,7 @@ final class StatusMonitor {
     var axEnabled = true
     private let axQueue = DispatchQueue(label: "com.dd.notchdial.ax", qos: .utility)
     private var axInFlight = false
+    private var axGeneration: UInt64 = 0
     private var axBusy: Set<Int> = []          // agents the UI says are working
     private var axUsable: Set<Int> = []        // apps whose AX tree we can actually read
     private var axStart: [Int: Date] = [:]
@@ -124,18 +125,45 @@ final class StatusMonitor {
         t.name.lowercased().replacingOccurrences(of: " ", with: "-")
     }
 
-    // `defaults write com.dd.notchdial statusDebug -bool true` → /tmp/nd-status.log
+    // `defaults write com.dd.notchdial statusDebug -bool true` → ~/Library/Logs/NotchDial/status.log
     static let debug = UserDefaults.standard.bool(forKey: "statusDebug")
+    /// Diagnostics that show a matched label are enormously more useful, and the
+    /// label is the title of the user's chat — read out of another application's
+    /// window. That never belongs in a log by default, and it certainly never
+    /// belonged in world-readable /tmp. Opt in explicitly to see the text.
+    static let logLabels = UserDefaults.standard.bool(forKey: "statusDebugLabels")
+    static func redact(_ s: String) -> String {
+        guard !logLabels, !s.isEmpty else { return s }
+        return "‹\(s.count) chars›"
+    }
+    private static let stamper: ISO8601DateFormatter = ISO8601DateFormatter()
+    private static let logDir = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/NotchDial")
+    static let logPath = (logDir as NSString).appendingPathComponent("status.log")
+    private static let logMaxBytes = 4 << 20
+    private var logHandle: FileHandle?
+    /// Held so stop() can remove it. Toggling the feature off and on used to stack
+    /// a fresh observer each time, against the same live monitor.
+    private var activateObserver: NSObjectProtocol?
     private func log(_ s: String) {
         guard Self.debug else { return }
-        let stamp = ISO8601DateFormatter().string(from: Date())
-        guard let d = "\(stamp) \(s)\n".data(using: .utf8) else { return }
-        let p = "/tmp/nd-status.log"
-        if let fh = FileHandle(forWritingAtPath: p) {
-            fh.seekToEndOfFile(); fh.write(d); try? fh.close()
-        } else {
-            try? d.write(to: URL(fileURLWithPath: p))
+        guard let d = "\(Self.stamper.string(from: Date())) \(s)\n".data(using: .utf8) else { return }
+        if logHandle == nil {
+            try? FileManager.default.createDirectory(atPath: Self.logDir, withIntermediateDirectories: true,
+                                                     attributes: [.posixPermissions: 0o700])
+            // O_NOFOLLOW: /tmp was a symlink-follow write primitive — anyone could
+            // point the log at a dotfile and have us append to it once a second.
+            let fd = open(Self.logPath, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0o600)
+            guard fd >= 0 else { return }
+            logHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         }
+        guard let fh = logHandle else { return }
+        if fh.offsetInFile > UInt64(Self.logMaxBytes) {          // rotate: keep one old file
+            try? fh.close(); logHandle = nil
+            try? FileManager.default.removeItem(atPath: Self.logPath + ".1")
+            try? FileManager.default.moveItem(atPath: Self.logPath, toPath: Self.logPath + ".1")
+            return log(s)
+        }
+        fh.write(d)
     }
 
     func start() {
@@ -158,7 +186,8 @@ final class StatusMonitor {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { _ = AXStatus.trusted(prompt: true) }
         }
         // switching to a finished app acknowledges its ✓
-        NSWorkspace.shared.notificationCenter.addObserver(
+        if let o = activateObserver { NSWorkspace.shared.notificationCenter.removeObserver(o) }
+        activateObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] n in
             guard let self = self,
                   let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
@@ -181,7 +210,10 @@ final class StatusMonitor {
         hot = [:]; cold = [:]; prevCPU = [:]; prevTime = nil; doneAt = [:]
         hbPrevSize = [:]; hbLastEvent = [:]; hbPrevEvent = [:]; hbActive = []; hbStart = [:]
         axBusy = []; axUsable = []; axStart = [:]; axOwed = []
-        axLive = [:]; axUnknownSince = [:]
+        axLive = [:]; axUnknownSince = [:]; since = [:]
+        axGeneration &+= 1; axInFlight = false; axSweepStarted = nil
+        if let o = activateObserver { NSWorkspace.shared.notificationCenter.removeObserver(o) }
+        activateObserver = nil
         onChange?(states)
     }
 
@@ -250,19 +282,67 @@ final class StatusMonitor {
         return s
     }
 
+    /// Everything we believe about one app, dropped. Called when the app quits and
+    /// when the Accessibility grant goes away — two situations that used to strand
+    /// the indicator: a quit app never appears in a sweep again, so nothing could
+    /// ever clear its spinner, and an untrusted app kept `axUsable`, which is what
+    /// suppresses the fallback signals. Either way the notch kept asserting
+    /// something it had no way to still know.
+    func forgetAX(_ id: Int) {
+        axUsable.remove(id); axBusy.remove(id); axOwed.remove(id)
+        axLive[id] = nil; axStart[id] = nil; axUnknownSince[id] = nil
+    }
+
+    func targetTerminated(_ id: Int, pid: pid_t?) {
+        if let p = pid { AXStatus.forget(pid: p) }
+        forgetAX(id)
+        // a spinner for an app that is gone is just a lie with a shorter lifespan
+        autoWorking.remove(id); hot[id] = 0; cold[id] = 0
+        log("TERMINATED id=\(id)")
+        publish()
+    }
+
+    private var axWasTrusted = true
+    private var axSweepStarted: Date?
+    /// A sweep that never comes back used to disable AX for the rest of the process:
+    /// `axInFlight` is only cleared by the completion hop, so one wedged app was a
+    /// permanent outage with no log line and no fallback.
+    var axSweepTimeout: TimeInterval = 10
+
     /// One AX sweep, off the main thread so a wedged app can never stall the island.
     private func pollAX() {
-        guard axEnabled, !axInFlight, AXStatus.trusted() else { return }
+        guard axEnabled else { return }
+        let trusted = AXStatus.trusted()
+        if trusted != axWasTrusted {
+            axWasTrusted = trusted
+            log("AX TRUST → \(trusted)")
+            if !trusted { for t in kTargets { forgetAX(t.id) }; publish() }
+        }
+        guard trusted else { return }
+        if axInFlight {
+            guard let s = axSweepStarted, Date().timeIntervalSince(s) > axSweepTimeout else { return }
+            log("AX sweep wedged for \(Int(Date().timeIntervalSince(s)))s — starting over")
+            axGeneration &+= 1
+            axInFlight = false
+        }
         var pids: [(Int, pid_t)] = []
-        for t in kTargets { if let p = AXStatus.pid(for: t) { pids.append((t.id, p)) } }
+        var missing: [Int] = []
+        for t in kTargets {
+            if let p = AXStatus.pid(for: t) { pids.append((t.id, p)) } else { missing.append(t.id) }
+        }
+        for id in missing where axUsable.contains(id) || axBusy.contains(id) {
+            targetTerminated(id, pid: nil)
+        }
         guard !pids.isEmpty else { return }
         axInFlight = true
+        axSweepStarted = Date()
+        let gen = axGeneration
         axQueue.async { [weak self] in
             var out: [Int: AXRead] = [:]
             var hits: [Int: String] = [:]
             for (id, pid) in pids {
+                AXStatus.setTimeout(pid: pid, 0.4)   // every sweep: a relaunched app is a new pid
                 if AXStatus.enableWebTree(pid: pid) {
-                    AXStatus.setTimeout(pid: pid, 0.4)
                     continue   // Chromium needs a beat to build the tree; read it next sweep
                 }
                 let p = AXStatus.probe(pid: pid)
@@ -271,9 +351,10 @@ final class StatusMonitor {
                 if p.busy { hits[id] = p.hit }
             }
             DispatchQueue.main.async {
-                guard let self = self else { return }
+                guard let self = self, gen == self.axGeneration else { return }
                 self.applyAX(out, hits: hits, now: Date())
                 self.axInFlight = false
+                self.axSweepStarted = nil
             }
         }
     }
@@ -350,9 +431,9 @@ final class StatusMonitor {
         if !res.isEmpty {
             // the hit string is what makes a spurious BUSY identifiable after the fact —
             // without it every flicker in the log is indistinguishable from a real turn
-            let why = hits.isEmpty ? "" : " hit=\(hits.map { "\($0.key):\($0.value)" }.sorted())"
+            let why = hits.isEmpty ? "" : " hit=\(hits.map { "\($0.key):\(Self.redact($0.value))" }.sorted())"
             let live = axLive.filter { !$0.value.isEmpty }
-            let held = live.isEmpty ? "" : " live=\(live.map { "\($0.key):\($0.value.sorted().joined(separator: "|"))" }.sorted())"
+            let held = live.isEmpty ? "" : " live=\(live.map { "\($0.key):\(Self.redact($0.value.sorted().joined(separator: "|")))" }.sorted())"
             log("AX res=\(res.map { "\($0.key):\($0.value.busy ? "BUSY" : "idle")/\($0.value.nodes)n\($0.value.complete ? "" : "~")" }.sorted()) usable=\(axUsable.sorted()) busy=\(axBusy.sorted())\(held)\(why)")
         }
         publish(now: now)
@@ -364,7 +445,14 @@ final class StatusMonitor {
         if hbEnabled {
             for (id, dir) in hbDir where !axUsable.contains(id) { hbSample(id, size: hbTotalSize(dir), now: now) }
         }
-        let cpu = cpuSample ?? Self.cpuSecondsByTarget()
+        // Sampling CPU means a proc_pidpath syscall for every process on the machine
+        // — ~875 of them here, once a second, on the main thread. It is the fallback
+        // for apps the Accessibility signal cannot read, so when there is no such app
+        // the entire sweep is answered and then thrown away. Ask only when someone
+        // is actually listening.
+        let needsCPU = kTargets.contains { !axUsable.contains($0.id) && $0.isRunning }
+        let cpu = cpuSample ?? (needsCPU ? Self.cpuSecondsByTarget() : [:])
+        if cpuSample == nil && !needsCPU { prevCPU = [:]; prevTime = nil }
         let front = frontmostBundlePath()
         if let pt = prevTime, now > pt {
             let dt = now.timeIntervalSince(pt)

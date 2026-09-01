@@ -1,0 +1,13 @@
+{
+  "name": "notchdial",
+  "version": "1.0.0",
+  "interface": {
+    "displayName": "NotchDial",
+    "shortDescription": "Live agent status in the MacBook notch",
+    "longDescription": "Reports turn boundaries to NotchDial so the notch shows a spinner while Codex is working and a green stamp when it finishes. Uses UserPromptSubmit and Stop, so every tool call in between stays inside the same turn — exact, rather than inferred from the UI.",
+    "developerName": "NotchDial",
+    "category": "Developer Tools",
+    "capabilities": ["Write"],
+    "websiteURL": "https://github.com/kkssoswag/NotchDial"
+  }
+}

@@ -64,9 +64,17 @@ So NotchDial reads the truth instead, in this order:
    being told. Install the bundled plugin:
 
    ```bash
+   # Claude Code
    /plugin marketplace add kkssoswag/NotchDial
    /plugin install notchdial
+
+   # Codex — same plugin, same hooks.json schema, same two events
+   codex plugin marketplace add kkssoswag/NotchDial
+   codex plugin add notchdial@notchdial
    ```
+
+   Codex asks you to trust a new hook before it will run it — approve it once in
+   the Codex TUI (`1 hook needs review`). Your existing `notify` is untouched.
 
    `UserPromptSubmit` → working, `Stop` → done, both `async` so they never delay the
    turn they report on. Everything between those two events — every tool call, every
@@ -75,9 +83,8 @@ So NotchDial reads the truth instead, in this order:
    Anthropic's cloud fires its hooks in the cloud container, so those fall back to
    signal 1.
 
-   Cursor (`~/.cursor/hooks.json`: `beforeSubmitPrompt` / `stop`) and Codex
-   (`notify` in `~/.codex/config.toml`, which gives you `agent-turn-complete`) can
-   drive the same file protocol below.
+   Cursor (`~/.cursor/hooks.json`: `beforeSubmitPrompt` / `stop`) can drive the same
+   file protocol below.
 
 3. **File protocol (explicit — agents report themselves).** One word into one file:
 
@@ -101,7 +108,10 @@ So NotchDial reads the truth instead, in this order:
 
 Toggle: menu bar → 工作状态指示, or `defaults write com.dd.notchdial statusEnabled -bool false`.
 Troubleshooting: `defaults write com.dd.notchdial statusDebug -bool true` logs every
-signal and state change to `/tmp/nd-status.log`.
+signal and state change to `~/Library/Logs/NotchDial/status.log` (mode 0600, rotated
+at 4 MB). Matched labels are your chat titles, read out of another app's window, so
+they are redacted to a length by default; add `statusDebugLabels -bool true` if you
+are tuning `busyPrefixes` and need to see the text.
 
 ## ⚡ One-prompt setup with your AI agent
 

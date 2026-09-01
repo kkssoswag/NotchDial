@@ -76,9 +76,17 @@ enum AXStatus {
         AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
         return true
     }
-    static func forgetActivation(pid: pid_t) {
-        lock.lock(); activated.remove(pid); lock.unlock()
+    /// Drop everything keyed to a pid. macOS reuses pids, and every one of these
+    /// caches is a promise about a process that no longer exists: `activated` would
+    /// make us skip the AXManualAccessibility opt-in for the new occupant (silently
+    /// killing the signal for that app until restart), and the element caches would
+    /// hand out references into a dead tree.
+    static func forget(pid: pid_t) {
+        lock.lock()
+        activated.remove(pid); rowCache[pid] = nil; scopeCache[pid] = nil; lastFull[pid] = nil
+        lock.unlock()
     }
+    static func forgetActivation(pid: pid_t) { forget(pid: pid) }
 
     // MARK: element helpers
     /// Last error from the root read, so an empty tree can name its own cause:
@@ -112,8 +120,9 @@ enum AXStatus {
     private static func ancestor(_ el: AXUIElement, up: Int) -> AXUIElement {
         var cur = el
         for _ in 0..<up {
-            guard let p = copy(cur, "AXParent" as CFString) else { break }
-            cur = unsafeBitCast(p, to: AXUIElement.self)
+            guard let p = copy(cur, "AXParent" as CFString),
+                  CFGetTypeID(p) == AXUIElementGetTypeID() else { break }
+            cur = (p as! AXUIElement)
         }
         return cur
     }
@@ -192,7 +201,8 @@ enum AXStatus {
 
     /// Read the cached row, if it still exists and still says something we know.
     private static func readCachedRow(_ pid: pid_t) -> Probe? {
-        guard let el = rowCache[pid] else { return nil }
+        lock.lock(); let cached = rowCache[pid]; lock.unlock()
+        guard let el = cached else { return nil }
         for a in labelAttrs {
             guard let s = string(el, a), !s.isEmpty else { continue }
             if let n = sessionName(s, prefix: runPrefix) {
@@ -202,7 +212,7 @@ enum AXStatus {
                 return Probe(busy: false, nodes: 1, ms: 0, hit: "", running: [], settled: [n], complete: true)
             }
         }
-        rowCache[pid] = nil          // re-rendered away; the next walk will find it again
+        lock.lock(); rowCache[pid] = nil; lock.unlock()   // re-rendered; the next walk finds it
         return nil
     }
 
@@ -214,21 +224,22 @@ enum AXStatus {
         }
         // The row element died but the list it lives in probably didn't. Re-finding it
         // inside that subtree is tens of nodes; starting from the window is thousands.
-        if let scope = scopeCache[pid] {
+        lock.lock(); let scope = scopeCache[pid]; let last = lastFull[pid]; lock.unlock()
+        if let scope = scope {
             var s = walk(from: [scope], pid: pid, budget: 900)
             if !s.running.isEmpty || !s.settled.isEmpty {
                 s.ms = Int(Date().timeIntervalSince(t0) * 1000)
                 s.hit = s.hit.isEmpty ? s.hit : "scoped " + s.hit
                 return s
             }
-            scopeCache[pid] = nil
+            lock.lock(); scopeCache[pid] = nil; lock.unlock()
         }
-        if let last = lastFull[pid], Date().timeIntervalSince(last) < fullScanEvery {
+        if let last = last, Date().timeIntervalSince(last) < fullScanEvery {
             // Not allowed to walk yet, and nothing cached: say so honestly rather
             // than reporting an idle we did not actually observe.
             return Probe(busy: false, nodes: 0, ms: 0, hit: "", running: [], settled: [], complete: false)
         }
-        lastFull[pid] = Date()
+        lock.lock(); lastFull[pid] = Date(); lock.unlock()
         let roots: [AXUIElement] = copy(AXUIElementCreateApplication(pid), kWindows) as? [AXUIElement]
             ?? kids(AXUIElementCreateApplication(pid))
         var p = walk(from: roots, pid: pid, budget: maxNodes)
@@ -263,8 +274,8 @@ enum AXStatus {
                             // Remember the row itself. It is the same element that will
                             // later read "Mark as unread <name>", so from here on the
                             // whole signal costs two IPC calls instead of a walk.
-                            rowCache[pid] = el
-                            scopeCache[pid] = ancestor(el, up: 4)
+                            let anc = ancestor(el, up: 4)
+                            lock.lock(); rowCache[pid] = el; scopeCache[pid] = anc; lock.unlock()
                             break outer
                         }
                         if let n = sessionName(s, prefix: settledPrefix) { p.settled.append(n); break }
@@ -294,11 +305,7 @@ enum AXStatus {
         return p
     }
 
-    static func pid(for t: AppTarget) -> pid_t? {
-        let url = URL(fileURLWithPath: t.path)
-        return NSWorkspace.shared.runningApplications
-            .first { $0.bundleURL == url }?.processIdentifier
-    }
+    static func pid(for t: AppTarget) -> pid_t? { RunningApps.pid(for: t) }
 
     /// Dumps every button-ish label in the tree — used by --axdump to learn what a
     /// given app actually calls its stop control, so busyWords can be tuned.

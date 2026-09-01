@@ -9,9 +9,40 @@ struct AppTarget: Identifiable {
     let planetHi: Color
     let planetLo: Color
 
-    var isRunning: Bool {
-        let url = URL(fileURLWithPath: path)
-        return NSWorkspace.shared.runningApplications.contains { $0.bundleURL == url }
+    /// Built once. URL(fileURLWithPath:) stats the path to decide the trailing
+    /// slash, so constructing it per call was a filesystem hit inside a 1 Hz loop.
+    var url: URL { TargetURLs.shared.map[path] ?? URL(fileURLWithPath: path) }
+
+    var isRunning: Bool { RunningApps.pid(for: self) != nil }
+}
+
+final class TargetURLs {
+    static let shared = TargetURLs()
+    let map: [String: URL]
+    private init() {
+        map = Dictionary(uniqueKeysWithValues: kTargets.map { ($0.path, URL(fileURLWithPath: $0.path)) })
+    }
+}
+
+/// One enumeration of NSWorkspace.runningApplications, kept fresh by the launch and
+/// terminate notifications the app already listens for. It used to be re-enumerated
+/// three times a second by the status poll and again on every system-wide app event.
+enum RunningApps {
+    private static var map: [Int: pid_t] = [:]
+    private static var primed = false
+    static func invalidate() { primed = false }
+    private static func prime() {
+        var m: [Int: pid_t] = [:]
+        for a in NSWorkspace.shared.runningApplications {
+            guard let u = a.bundleURL else { continue }
+            for t in kTargets where t.url == u { m[t.id] = a.processIdentifier }
+        }
+        map = m
+        primed = true
+    }
+    static func pid(for t: AppTarget) -> pid_t? {
+        if !primed { prime() }
+        return map[t.id]
     }
 }
 

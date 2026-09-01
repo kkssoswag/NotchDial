@@ -1,10 +1,13 @@
 {
   "name": "notchdial",
-  "owner": { "name": "NotchDial", "url": "https://github.com/kkssoswag/NotchDial" },
+  "owner": {
+    "name": "NotchDial",
+    "url": "https://github.com/kkssoswag/NotchDial"
+  },
   "plugins": [
     {
       "name": "notchdial",
-      "source": "./plugin",
+      "source": "./plugins/notchdial",
       "description": "Live agent status in the MacBook notch: a spinner while Claude Code works, a green stamp when it finishes."
     }
   ]

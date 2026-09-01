@@ -6,7 +6,7 @@
           {
             "type": "command",
             "async": true,
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/notchdial-status.sh working"
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/notchdial-status.sh working claude-code"
           }
         ]
       }
@@ -17,7 +17,7 @@
           {
             "type": "command",
             "async": true,
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/notchdial-status.sh done"
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/notchdial-status.sh done claude-code"
           }
         ]
       }
@@ -28,7 +28,7 @@
           {
             "type": "command",
             "async": true,
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/notchdial-status.sh clear"
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/notchdial-status.sh clear claude-code"
           }
         ]
       }
