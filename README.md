@@ -43,16 +43,43 @@ So NotchDial reads the truth instead, in this order:
    stop/interrupt control. That label is the same thing you see on screen, per
    session, and it is correct for cloud and local runs alike. One catch: Chromium
    keeps its web accessibility tree switched off until an assistive client opts in,
-   so NotchDial writes `AXManualAccessibility` on the app first — after that a scan
-   finds the state in ~10–30 ms over ~100 nodes, off the main thread, and exits early
-   on the first hit.
+   so NotchDial writes `AXManualAccessibility` on the app first.
+
+   The trick is to watch the row rather than sample the tree. The sidebar row is
+   *two-sided* — "Running <name>" while live, "Mark as unread <name>" when not — so
+   once it has been located it answers the whole question by itself: 2 IPC calls per
+   second instead of a full walk, and no false "idle" when the tree comes back
+   partial under load (it does, constantly). Walking every second is not a neutral
+   act, either: it made all three Electron apps stop reporting their windows at all,
+   for ~18 s. Reads are three-valued — working / finished / **unknown** — and unknown
+   holds the previous state instead of inventing an idle.
 
    Needs a one-time grant: **menu bar → 精确状态**, or System Settings › Privacy &
    Security › Accessibility › NotchDial. Nothing else to configure, ever. (Ad-hoc
    signed builds change identity on every rebuild, so macOS may ask again after you
    rebuild from source.)
 
-2. **File protocol (explicit — agents report themselves).** One word into one file:
+2. **Hooks (exact — the agent tells you).** For **local** Claude Code sessions this
+   beats everything above, because nothing you can observe from outside is as good as
+   being told. Install the bundled plugin:
+
+   ```bash
+   /plugin marketplace add kkssoswag/NotchDial
+   /plugin install notchdial
+   ```
+
+   `UserPromptSubmit` → working, `Stop` → done, both `async` so they never delay the
+   turn they report on. Everything between those two events — every tool call, every
+   retry — stays *working*, which is precisely what a sampled UI signal cannot get
+   right. Note this covers sessions running **on your Mac**; a session running in
+   Anthropic's cloud fires its hooks in the cloud container, so those fall back to
+   signal 1.
+
+   Cursor (`~/.cursor/hooks.json`: `beforeSubmitPrompt` / `stop`) and Codex
+   (`notify` in `~/.codex/config.toml`, which gives you `agent-turn-complete`) can
+   drive the same file protocol below.
+
+3. **File protocol (explicit — agents report themselves).** One word into one file:
 
    ```bash
    mkdir -p ~/.notchdial/status
@@ -62,18 +89,10 @@ So NotchDial reads the truth instead, in this order:
 
    The file name is the target's slug: its `name` in `Targets.swift`, lowercased, spaces → `-` (`codex`, `cursor`, `claude-code`). `working` files older than 30 min are ignored (crashed agent); NotchDial deletes the file once the ✓ is acknowledged.
 
-   Claude Code wiring (`~/.claude/settings.json` hooks):
+   The plugin above writes exactly this; anything else — a wrapper script, a CI job,
+   the agent itself — needs only that one `echo`.
 
-   ```json
-   {"hooks": {
-     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "mkdir -p ~/.notchdial/status; echo working > ~/.notchdial/status/claude-code"}]}],
-     "Stop":             [{"hooks": [{"type": "command", "command": "echo done > ~/.notchdial/status/claude-code"}]}]
-   }}
-   ```
-
-   Codex / Cursor / anything else: any hook, wrapper script, or the agent itself running that one `echo` works the same way.
-
-3. **Local-work fallback (only where 1 and 2 are silent).** Sustained CPU from a
+4. **Local-work fallback (only where 1–3 are silent).** Sustained CPU from a
    **background** app's process tree — a local build, an export, indexing — reads as
    *working*, via pure `libproc` syscalls (nothing spawned, no permissions). The
    frontmost app never auto-triggers, because using an app is not the same as the app

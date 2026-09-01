@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "async": true,
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/notchdial-status.sh working"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "async": true,
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/notchdial-status.sh done"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "async": true,
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/notchdial-status.sh clear"
+          }
+        ]
+      }
+    ]
+  }
+}
