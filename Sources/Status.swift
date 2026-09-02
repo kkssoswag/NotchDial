@@ -811,22 +811,108 @@ struct WorkSpinner: View {
     let tint: Color
     var size: CGFloat = 16
     var lineWidth: CGFloat = 2.4
-    @State private var spin = false
     var body: some View {
-        ZStack {
-            Circle()
-                .stroke(tint.opacity(0.22), lineWidth: lineWidth)
-            Circle()
-                .trim(from: 0, to: 0.32)
-                .stroke(tint, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
-                .rotationEffect(.degrees(spin ? 360 : 0))
-                .shadow(color: tint.opacity(0.85), radius: 3.5)
+        // This glyph spins for as long as any agent works — most of the day. Any
+        // SwiftUI animation of it (repeatForever, TimelineView) re-runs the view graph
+        // every frame in *this* process: measured ~3% CPU on a 16 pt glyph, sampled to
+        // the display cycle. So the comet is two CAShapeLayers and the rotation is a
+        // CABasicAnimation, which the window server runs by itself. App cost: nothing.
+        CometLayerView(tint: tint, lineWidth: lineWidth)
+            .frame(width: size, height: size)
+    }
+}
+
+/// The comet spinner as Core Animation layers: a dim track, a glowing 32% arc, and an
+/// infinite rotation the render server owns. See WorkSpinner for why.
+struct CometLayerView: NSViewRepresentable {
+    let tint: Color
+    let lineWidth: CGFloat
+    /// one revolution
+    static let period: TimeInterval = 0.9
+
+    final class Host: NSView {
+        let track = CAShapeLayer()
+        let comet = CAShapeLayer()
+        override init(frame: NSRect) {
+            super.init(frame: frame)
+            // layer-hosting (layer set before wantsLayer): the sublayers are ours
+            let root = CALayer()
+            root.masksToBounds = false            // the glow reaches past the bounds
+            root.isGeometryFlipped = true         // y-down, like SwiftUI: same arc, same spin direction
+            layer = root
+            wantsLayer = true
+            for l in [track, comet] {
+                l.fillColor = nil
+                l.lineCap = .round
+                l.masksToBounds = false
+                root.addSublayer(l)
+            }
+            comet.strokeStart = 0
+            comet.strokeEnd = 0.32
+            comet.shadowOffset = .zero
+            comet.shadowRadius = 3.5
+            comet.shadowOpacity = 1
+            // the blurred comet is rasterized once; the rotation transforms the raster
+            comet.shouldRasterize = true
         }
-        .frame(width: size, height: size)
-        .onAppear {
-            spin = false
-            withAnimation(.linear(duration: 0.9).repeatForever(autoreverses: false)) { spin = true }
+        required init?(coder: NSCoder) { fatalError() }
+        override func setFrameSize(_ s: NSSize) { super.setFrameSize(s); needsLayout = true }
+
+        func apply(tint: NSColor, lineWidth: CGFloat) {
+            track.lineWidth = lineWidth
+            comet.lineWidth = lineWidth
+            track.strokeColor = tint.withAlphaComponent(0.22).cgColor
+            comet.strokeColor = tint.cgColor
+            comet.shadowColor = tint.withAlphaComponent(0.85).cgColor
         }
+
+        override func layout() {
+            super.layout()
+            let b = bounds
+            guard b.width > 0, b.height > 0 else { return }
+            let scale = window?.backingScaleFactor ?? 2
+            // SwiftUI's Circle().stroke centers the stroke on the frame's inscribed circle
+            // (half the line outside the frame); same here, nothing is clipped
+            let path = CGPath(ellipseIn: b, transform: nil)
+            for l in [track, comet] {
+                l.frame = b
+                l.path = path
+                l.contentsScale = scale
+                l.rasterizationScale = scale
+            }
+            // the arc starts at 3 o'clock on a CGPath ellipse; SwiftUI's Circle.trim
+            // starts there too, so the glyph looks exactly as it did
+            spin()
+        }
+
+        func spin() {
+            guard comet.animation(forKey: "spin") == nil else { return }
+            let a = CABasicAnimation(keyPath: "transform.rotation.z")
+            a.fromValue = 0
+            a.toValue = 2 * Double.pi
+            a.duration = CometLayerView.period
+            a.repeatCount = .infinity
+            a.isRemovedOnCompletion = false
+            comet.add(a, forKey: "spin")
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            // a layer that left the tree drops its animations; a fresh window means start over
+            comet.removeAnimation(forKey: "spin")
+            needsLayout = true
+        }
+    }
+
+    func makeNSView(context: Context) -> Host {
+        let v = Host(frame: .zero)
+        v.apply(tint: NSColor(tint), lineWidth: lineWidth)
+        return v
+    }
+
+    func updateNSView(_ v: Host, context: Context) {
+        v.apply(tint: NSColor(tint), lineWidth: lineWidth)
+        v.needsLayout = true
     }
 }
 

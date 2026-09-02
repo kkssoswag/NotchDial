@@ -125,12 +125,20 @@ So NotchDial reads the truth instead, in this order:
    AX stop-button — it can't name the session or pin the exact boundary — but it
    works where AX can't. Toggle: `defaults write com.dd.notchdial statusNet -bool false`.
 
-   Cost: the nettop child sits at ~0.4% CPU. It **must** be launched with an idle
-   pipe on stdin — nettop keeps an interactive key loop even in `-x -l 0` mode, and
-   with `/dev/null` (what a launchd-started GUI app hands its children) that loop
-   spins at 120%+ CPU forever. NotchDial does this; if you ever see a hot `nettop`
-   under it, that is the bug to look for. NotchDial also retires any other running
-   copy of itself on launch, so a redeploy can't stack two instances and two helpers.
+   Cost: the nettop child sits at ~1% CPU. It **must** be launched with an idle pipe
+   on stdin — nettop keeps an interactive key loop even in `-x -l 0` mode, and with
+   `/dev/null` (what a launchd-started GUI app hands its children) that loop spins at
+   120%+ CPU forever. NotchDial does this; if you ever see a hot `nettop` under it,
+   that is the bug to look for. NotchDial also retires any other running copy of
+   itself on launch, so a redeploy can't stack two instances and two helpers.
+
+   The whole app measures **~1% CPU idle and ~1.2% with an agent working**, plus that
+   nettop. The working figure is the one to watch, because the spinner runs for hours:
+   animating it in SwiftUI (`repeatForever`, or a `TimelineView`) re-runs the view
+   graph every display frame in-process — 120 Hz on a ProMotion panel, measured at
+   ~5% CPU for one 16 pt glyph. So the comet is two `CAShapeLayer`s driven by a
+   `CABasicAnimation`: the render server animates it and this process does nothing.
+   Any always-on animation added here should follow the same rule.
 
 3. **File protocol (explicit — agents report themselves).** One word into one file:
 
