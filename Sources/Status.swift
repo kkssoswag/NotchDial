@@ -3,12 +3,19 @@ import SwiftUI
 import Darwin
 
 // MARK: - Agent work status
-// Two signals, merged per target:
-//   1. File protocol (precise, agent-reported):  ~/.notchdial/status/<slug>
+// Three signals, merged per target, in order of authority:
+//   1. Accessibility (exact, read from the app's own UI): the sidebar row that says
+//      "Running <name>" / "Mark as unread <name>" and the composer's interrupt control.
+//      Where this can read the app, nothing else gets a vote.
+//   2. Network inflow (automatic fallback): tokens streaming in from the cloud, for a
+//      backgrounded app whose a11y tree Chromium has torn down.
+//   3. File protocol (explicit, agent-reported): ~/.notchdial/status/<slug>[.<session>]
 //      slug = target name lowercased, spaces → "-"  (codex, cursor, claude-code)
-//      content = "working" | "done" | "idle"
-//   2. CPU fallback (automatic): sustained utilization of the app's process tree,
-//      sampled via libproc — no processes spawned, no permissions needed.
+//      content = "working" | "done" | "idle". Written by the bundled hooks plugin.
+// Two signals we measured and removed: CPU utilization (an idle app spiked to 51%,
+// a streaming one sat at 1%) and local-storage writes (22x HIGHER while idle). Both
+// lied more often than they helped, and CPU sampling cost a proc_pidpath syscall per
+// process on the machine every second on the main thread.
 // A finished task shows ✓ until the user actually switches to that app (or keeps
 // it frontmost for a beat) — then the state clears and the status file is removed.
 
@@ -16,13 +23,9 @@ enum WorkState: Equatable { case idle, working, done }
 
 final class StatusMonitor {
     // tunables
-    var cpuOn = 0.30                       // ≥ this utilization (1.0 = one core) is a hot sample
-    var cpuOff = 0.06                      // ≤ this is a cold sample; between = ambiguous
-    var hotNeeded = 6                      // consecutive hot samples to latch working (~9 s)
-    var coldNeeded = 4                     // consecutive cold samples to release
-    var minWorkForDone: TimeInterval = 8   // shorter bursts end silently, not with a ✓
-    // The 8 s floor above exists to stop the *guessing* signals from stamping every
-    // CPU blip. The Accessibility signal is exact — a turn that really ran deserves
+    var minWorkForDone: TimeInterval = 8   // a guessed burst shorter than this ends silently, not with a ✓
+    // The 8 s floor above exists to stop the *guessing* signal from stamping every
+    // traffic blip. The Accessibility signal is exact — a turn that really ran deserves
     // its stamp however short it was, so it gets its own much lower floor.
     var axMinWork: TimeInterval = 2
     var workingTTL: TimeInterval = 30 * 60 // stale "working" files are ignored (crashed agent)
@@ -35,36 +38,12 @@ final class StatusMonitor {
 
     var dirPath = (NSHomeDirectory() as NSString).appendingPathComponent(".notchdial/status")
     var frontmostBundlePath: () -> String? = { NSWorkspace.shared.frontmostApplication?.bundleURL?.path }
+    /// Injectable so the self-test does not depend on which apps happen to be open.
+    var isRunning: (AppTarget) -> Bool = { $0.isRunning }
     var onChange: (([Int: WorkState]) -> Void)?
     var onTimes: (([Int: Date]) -> Void)?
 
-    // MARK: live heartbeat (thin-client sync)
-    // Cloud-side agents barely touch local CPU — but their desktop apps commit the
-    // streaming conversation to local storage as tokens arrive. The Claude app writes
-    // claude.ai's IndexedDB (LevelDB) within ~a second of you hitting send, and keeps
-    // appending for as long as the agent is thinking/answering. Watching that
-    // directory's byte growth gives instant, truthful working/done — no hooks needed.
-    static let heartbeatDirs: [String: String] = [   // bundle-path suffix → storage dir
-        "/Claude.app": NSHomeDirectory() + "/Library/Application Support/Claude/IndexedDB/https_claude.ai_0.indexeddb.leveldb"
-    ]
-    // Real-world pattern (measured): commits arrive in intermittent batches, every
-    // 2–5 s while a session streams, up to ~6 KB each, dead silent when idle.
-    // OFF by default: the controlled experiment showed storage writes are *higher*
-    // while the agent is idle, so this signal lies more often than it helps. Kept
-    // behind `defaults write com.dd.notchdial statusHeartbeat -bool true` only for
-    // apps that persist locally in a way that really does track their work.
-    var hbEnabled = UserDefaults.standard.bool(forKey: "statusHeartbeat")
     private lazy var net: NetMonitor? = NetMonitor(targets: kTargets)
-    var hbGrowthOn: UInt64 = 256          // bytes of growth that count as one commit event
-    var hbEventGap: TimeInterval = 6      // two commits this close together = live session
-    var hbBigCommit: UInt64 = 4096        // a single commit this large latches instantly (the send itself)
-    var hbQuiet: TimeInterval = 12        // this long without commits = the session went quiet
-    private var hbDir: [Int: String] = [:]
-    private var hbPrevSize: [Int: UInt64] = [:]
-    private var hbLastEvent: [Int: Date] = [:]
-    private var hbPrevEvent: [Int: Date] = [:]
-    private var hbActive: Set<Int> = []
-    private var hbStart: [Int: Date] = [:]
 
     // MARK: accessibility signal (authoritative)
     // The app's own UI is the only source that cannot be wrong: Claude's sidebar
@@ -222,13 +201,12 @@ final class StatusMonitor {
     /// you how long a thing has been running, and that needs a start, not just a flag.
     private(set) var since: [Int: Date] = [:]
     private var timer: Timer?
-    private var prevCPU: [Int: Double] = [:]
-    private var prevTime: Date?
-    private var hot: [Int: Int] = [:]
-    private var cold: [Int: Int] = [:]
-    private var autoWorking: Set<Int> = []
+    /// When the previous tick ran, so a starved run loop is measured rather than
+    /// assumed: a byte count that piled up over ten seconds is not a ten-fold rate.
+    private var lastTick: Date?
+    /// A ✓ minted by a signal, waiting to be seen. (The file protocol's "done" lives
+    /// in its file instead.)
     private var autoDone: Set<Int> = []
-    private var workStart: [Int: Date] = [:]
     private var doneAt: [Int: Date] = [:]
 
     static func slug(_ t: AppTarget) -> String {
@@ -255,9 +233,6 @@ final class StatusMonitor {
     static let logPath = (logDir as NSString).appendingPathComponent("status.log")
     private static let logMaxBytes = 4 << 20
     private var logHandle: FileHandle?
-    /// Held so stop() can remove it. Toggling the feature off and on used to stack
-    /// a fresh observer each time, against the same live monitor.
-    private var activateObserver: NSObjectProtocol?
     func logExternal(_ s: String) { log(s) }
     private func log(_ s: String) {
         guard Self.debug else { return }
@@ -283,60 +258,41 @@ final class StatusMonitor {
 
     func start() {
         guard timer == nil else { return }
-        let d = UserDefaults.standard
-        if d.object(forKey: "statusCpuOn") != nil { cpuOn = d.double(forKey: "statusCpuOn") }
-        for t in kTargets {
-            for (suffix, dir) in Self.heartbeatDirs where t.path.hasSuffix(suffix) {
-                if FileManager.default.fileExists(atPath: dir) { hbDir[t.id] = dir }
-            }
-        }
         let tm = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(tm, forMode: .common)
         timer = tm
         if netEnabled, UserDefaults.standard.object(forKey: "statusNet") as? Bool ?? true { net?.start() }
         else { netEnabled = false }
-        log("START axEnabled=\(axEnabled) trusted=\(AXStatus.trusted()) hb=\(hbEnabled) hbDirs=\(hbDir.count) pids=\(kTargets.compactMap { AXStatus.pid(for: $0) })")
+        log("START axEnabled=\(axEnabled) trusted=\(AXStatus.trusted()) net=\(netEnabled) pids=\(kTargets.compactMap { AXStatus.pid(for: $0) })")
         // Exact status needs one Accessibility grant. Ask once, ever; the menu item
         // stays available for later. Without it we quietly fall back to guessing.
         if axEnabled, !AXStatus.trusted(), !UserDefaults.standard.bool(forKey: "axPromptShown") {
             UserDefaults.standard.set(true, forKey: "axPromptShown")
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { _ = AXStatus.trusted(prompt: true) }
         }
-        // switching to a finished app acknowledges its ✓
-        if let o = activateObserver { NSWorkspace.shared.notificationCenter.removeObserver(o) }
-        activateObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] n in
-            guard let self = self,
-                  let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                  let path = app.bundleURL?.path else { return }
-            for t in kTargets where t.path == path && self.states[t.id] == .done {
-                let shown = self.doneAt[t.id].map { Date().timeIntervalSince($0) } ?? 0
-                let wait = max(1.5, self.doneLinger - shown)
-                DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
-                    guard let self = self, self.states[t.id] == .done else { return }
-                    self.clearDone(t)
-                }
-            }
-        }
+        // Switching to a finished app acknowledges its ✓: publish() clears a stamp that
+        // has been frontmost for doneLinger, on every tick. (This used to also arm a
+        // one-shot timer from the activation notification, which could not be cancelled
+        // and would wipe a *newer* stamp minted after it was scheduled.)
         tick()
     }
 
     func stop() {
         timer?.invalidate(); timer = nil
         net?.stop()
-        netWorking = []; netHot = [:]; netLastActive = [:]; netStart = [:]
-        states = [:]; autoWorking = []; autoDone = []
-        hot = [:]; cold = [:]; prevCPU = [:]; prevTime = nil; doneAt = [:]
-        hbPrevSize = [:]; hbLastEvent = [:]; hbPrevEvent = [:]; hbActive = []; hbStart = [:]
+        netWorking = []; netHot = [:]; netLastActive = [:]; netStart = [:]; netLastBytes = [:]
+        states = [:]; autoDone = []; doneAt = [:]; lastTick = nil
         axBusy = []; axUsable = []; axStart = [:]; axOwed = []
         axLive = [:]; axUnknownSince = [:]; since = [:]; axLastGood = [:]
         sessState = [:]; sessSince = [:]; sessions = [:]; quietSince = [:]; onSessions?([:])
-        axGeneration &+= 1; axInFlight = false; axSweepStarted = nil
-        if let o = activateObserver { NSWorkspace.shared.notificationCenter.removeObserver(o) }
-        activateObserver = nil
+        axGeneration &+= 1; axSweepID &+= 1; axInFlight = false; axSweepStarted = nil; axWedged = false
+        axWasTrusted = true
         onChange?(states)
+        onTimes?(since)
     }
 
+    /// The user has seen this app's ✓ — by switching to the app, or by clicking its
+    /// ledger row. Drops the stamp and everything that would re-mint it.
     func clearDone(_ t: AppTarget) {
         autoDone.remove(t.id)
         axOwed.remove(t.id)      // seen — the debt is paid
@@ -347,23 +303,29 @@ final class StatusMonitor {
         publish()
     }
 
+    /// Acknowledging a ✓ removes the files that said "done" — never one that still
+    /// says "working": a session that is mid-turn is not ours to silence.
     private func removeFile(_ t: AppTarget) {
-        for f in statusFiles(t) {
-            try? FileManager.default.removeItem(atPath: (dirPath as NSString).appendingPathComponent(f))
+        for f in statusFiles(t, in: listStatusDir()) {
+            let p = (dirPath as NSString).appendingPathComponent(f)
+            if let (w, _) = word(inFile: p), w == "working" { continue }
+            try? FileManager.default.removeItem(atPath: p)
         }
+    }
+
+    /// One directory listing per pass — publish() asks about every target, and the
+    /// answer for all of them is in the same listing.
+    private func listStatusDir() -> [String] {
+        (try? FileManager.default.contentsOfDirectory(atPath: dirPath)) ?? []
     }
 
     /// Every file belonging to this target: the bare slug, and one per session
     /// (`claude-code.<session>`). Concurrent sessions each report for themselves —
     /// sharing one file meant session A's "done" erased the fact that B was still
     /// working, which is the same bug the Accessibility path had.
-    private func statusFiles(_ t: AppTarget) -> [String] {
+    private func statusFiles(_ t: AppTarget, in names: [String]) -> [String] {
         let base = Self.slug(t)
-        var out = [base, base + ".txt"]
-        if let names = try? FileManager.default.contentsOfDirectory(atPath: dirPath) {
-            out += names.filter { $0.hasPrefix(base + ".") && $0 != base + ".txt" }.sorted()
-        }
-        return out
+        return [base, base + ".txt"] + names.filter { $0.hasPrefix(base + ".") && $0 != base + ".txt" }.sorted()
     }
 
     /// Read one word out of one file, cheaply and with a bound. A runaway hook that
@@ -381,9 +343,9 @@ final class StatusMonitor {
         return (w, mtime.map { Date().timeIntervalSince($0) } ?? .infinity)
     }
 
-    private func fileState(_ t: AppTarget) -> WorkState? {
+    private func fileState(_ t: AppTarget, in names: [String]) -> WorkState? {
         var agg: WorkState? = nil
-        for f in statusFiles(t) {
+        for f in statusFiles(t, in: names) {
             let p = (dirPath as NSString).appendingPathComponent(f)
             guard let (w, age) = word(inFile: p) else { continue }
             // any session working wins; a stamp only survives if nothing is working
@@ -392,41 +354,6 @@ final class StatusMonitor {
             if w == "idle" && agg == nil { agg = .idle }
         }
         return agg
-    }
-
-    // one heartbeat measurement + state step; injectable for the self-test
-    func hbSample(_ id: Int, size: UInt64, now: Date) {
-        let prev = hbPrevSize[id] ?? size
-        hbPrevSize[id] = size
-        let delta = size > prev ? size - prev : 0
-        if delta >= hbGrowthOn {   // one storage commit
-            let previous = hbLastEvent[id]
-            hbPrevEvent[id] = previous
-            hbLastEvent[id] = now
-            let paired = previous.map { now.timeIntervalSince($0) <= hbEventGap } ?? false
-            if !hbActive.contains(id), paired || delta >= hbBigCommit {
-                hbActive.insert(id)
-                autoDone.remove(id)
-                hbStart[id] = previous ?? now
-            }
-        }
-        if hbActive.contains(id), let last = hbLastEvent[id], now.timeIntervalSince(last) >= hbQuiet {
-            hbActive.remove(id)
-            if now.timeIntervalSince(hbStart[id] ?? now) >= minWorkForDone {
-                autoDone.insert(id)
-            }
-        }
-    }
-
-    private func hbTotalSize(_ dir: String) -> UInt64 {
-        let fm = FileManager.default
-        guard let names = try? fm.contentsOfDirectory(atPath: dir) else { return 0 }
-        var s: UInt64 = 0
-        for n in names {
-            if let a = try? fm.attributesOfItem(atPath: (dir as NSString).appendingPathComponent(n)),
-               let sz = a[.size] as? UInt64 { s += sz }
-        }
-        return s
     }
 
     /// Everything we believe about one app, dropped. Called when the app quits and
@@ -442,11 +369,14 @@ final class StatusMonitor {
         rebuildSessions()
     }
 
+    /// The app is gone. Every signal about it goes with it — including the network
+    /// one, which used to survive this and then mint a ✓ that nothing could dismiss
+    /// (a stamp is acknowledged by bringing the app frontmost, and a quit app never is).
     func targetTerminated(_ id: Int, pid: pid_t?) {
         if let p = pid { AXStatus.forget(pid: p) }
         forgetAX(id)
-        // a spinner for an app that is gone is just a lie with a shorter lifespan
-        autoWorking.remove(id); hot[id] = 0; cold[id] = 0
+        netWorking.remove(id); netHot[id] = 0; netLastActive[id] = nil; netStart[id] = nil
+        autoDone.remove(id); doneAt[id] = nil
         log("TERMINATED id=\(id)")
         publish()
     }
@@ -457,6 +387,11 @@ final class StatusMonitor {
     /// `axInFlight` is only cleared by the completion hop, so one wedged app was a
     /// permanent outage with no log line and no fallback.
     var axSweepTimeout: TimeInterval = 10
+    /// Set once a wedged sweep has been given up on, so it is logged and released once.
+    private var axWedged = false
+    /// Identifies the sweep currently in flight, so a sweep that outlived a stop()/
+    /// start() cycle cannot release the flag on behalf of the one dispatched after it.
+    private var axSweepID: UInt64 = 0
 
     /// One AX sweep, off the main thread so a wedged app can never stall the island.
     private func pollAX() {
@@ -469,10 +404,18 @@ final class StatusMonitor {
         }
         guard trusted else { return }
         if axInFlight {
-            guard let s = axSweepStarted, Date().timeIntervalSince(s) > axSweepTimeout else { return }
-            log("AX sweep wedged for \(Int(Date().timeIntervalSince(s)))s — starting over")
+            guard let s = axSweepStarted, Date().timeIntervalSince(s) > axSweepTimeout, !axWedged else { return }
+            // The sweep queue is serial, so "start over" cannot mean dispatching another
+            // sweep — it would only queue behind the wedge, one more every timeout,
+            // against an app that is already not answering. Give up on this sweep's
+            // result, release AX's claim so the fallback speaks, and wait for it to
+            // actually return before asking again.
+            log("AX sweep wedged for \(Int(Date().timeIntervalSince(s)))s — result discarded, fallback released")
+            axWedged = true
             axGeneration &+= 1
-            axInFlight = false
+            for t in kTargets { forgetAX(t.id) }
+            publish()
+            return
         }
         var pids: [(Int, pid_t)] = []
         var missing: [Int] = []
@@ -484,8 +427,10 @@ final class StatusMonitor {
         }
         guard !pids.isEmpty else { return }
         axInFlight = true
+        axWedged = false
         axSweepStarted = Date()
-        let gen = axGeneration
+        axSweepID &+= 1
+        let gen = axGeneration, mine = axSweepID
         axQueue.async { [weak self] in
             var out: [Int: AXRead] = [:]
             var hits: [Int: String] = [:]
@@ -502,10 +447,13 @@ final class StatusMonitor {
                 if p.busy { hits[id] = p.hit }
             }
             DispatchQueue.main.async {
-                guard let self = self, gen == self.axGeneration else { return }
+                guard let self = self else { return }
+                // The sweep is over whether or not anyone still wants its answer. It
+                // releases the in-flight flag only if it is still the current sweep, and
+                // a stale generation (stop(), or a wedge given up on) throws the answer away.
+                if mine == self.axSweepID { self.axInFlight = false; self.axSweepStarted = nil }
+                guard gen == self.axGeneration else { return }
                 self.applyAX(out, hits: hits, now: Date())
-                self.axInFlight = false
-                self.axSweepStarted = nil
             }
         }
     }
@@ -549,14 +497,20 @@ final class StatusMonitor {
             // named session. Each of those refreshes a timestamp.
             let good = r.nodes >= 20 || !r.running.isEmpty || !r.settled.isEmpty
             if good { axUsable.insert(id); axLastGood[id] = now }
-            else if r.complete { axUsable.remove(id); axLastGood[id] = nil }
+            else if r.complete { axUsable.remove(id) }
             // The bug that made status "never match": a truncated/empty read neither
             // inserted nor removed, so once an app was usable it stayed authoritative
             // FOREVER through blind sweeps — which also suppressed the fallback. So an
             // app that has not produced a single readable sweep in axUsableTTL is no
             // longer trusted as the source of truth, and the fallback can take over.
+            //
+            // The timestamp must survive a bare-but-complete read. Clearing it there
+            // made this branch unreachable in exactly the case it exists for: an app
+            // mid-turn whose tree Chromium tears down answers with a complete tree of
+            // one node, `axUsable` dropped, and the `continue` below skipped everything
+            // that could have released `axBusy` — a spinner for the rest of the process.
             if let last = axLastGood[id], now.timeIntervalSince(last) >= axUsableTTL {
-                axUsable.remove(id); axLastGood[id] = nil; forgetAX(id)
+                axUsable.remove(id); forgetAX(id)   // also clears axLastGood
             }
             guard axUsable.contains(id) else { continue }
             let busy: Bool
@@ -616,54 +570,15 @@ final class StatusMonitor {
         publish(now: now)
     }
 
-    // one sampling step; cpuSample/now injectable for the self-test
-    func tick(cpuSample: [Int: Double]? = nil, now: Date = Date()) {
+    /// One sampling step. `now` is injectable for the self-test.
+    func tick(now: Date = Date()) {
         pollAX()
-        if hbEnabled {
-            for (id, dir) in hbDir where !axUsable.contains(id) { hbSample(id, size: hbTotalSize(dir), now: now) }
-        }
-        // Sampling CPU means a proc_pidpath syscall for every process on the machine
-        // — ~875 of them here, once a second, on the main thread. It is the fallback
-        // for apps the Accessibility signal cannot read, so when there is no such app
-        // the entire sweep is answered and then thrown away. Ask only when someone
-        // is actually listening.
-        let needsCPU = kTargets.contains { !axUsable.contains($0.id) && $0.isRunning }
-        let cpu = cpuSample ?? (needsCPU ? Self.cpuSecondsByTarget() : [:])
-        if cpuSample == nil && !needsCPU { prevCPU = [:]; prevTime = nil }
-        let front = frontmostBundlePath()
-        if let pt = prevTime, now > pt {
-            let dt = now.timeIntervalSince(pt)
-            for t in kTargets {
-                let prev = prevCPU[t.id] ?? (cpu[t.id] ?? 0)
-                let util = max(0, (cpu[t.id] ?? 0) - prev) / dt
-                // The frontmost app is being *used*, which is not the same as *working*:
-                // typing, scrolling and rendering all burn CPU. Auto detection therefore
-                // only ever applies to background apps; file-reported states always win.
-                if axUsable.contains(t.id) {
-                    hot[t.id] = 0                 // AX knows the truth for this app
-                    autoWorking.remove(t.id)
-                } else if front == t.path {
-                    hot[t.id] = 0
-                    autoWorking.remove(t.id)
-                } else if util >= cpuOn { hot[t.id, default: 0] += 1; cold[t.id] = 0 }
-                else if util <= cpuOff { cold[t.id, default: 0] += 1; hot[t.id] = 0 }
-                else { hot[t.id] = 0; cold[t.id] = 0 }
-                if !autoWorking.contains(t.id), hot[t.id, default: 0] >= hotNeeded {
-                    autoWorking.insert(t.id)
-                    autoDone.remove(t.id)
-                    workStart[t.id] = now.addingTimeInterval(-Double(hotNeeded) * dt)
-                }
-                if autoWorking.contains(t.id), cold[t.id, default: 0] >= coldNeeded {
-                    autoWorking.remove(t.id)
-                    if now.timeIntervalSince(workStart[t.id] ?? now) >= minWorkForDone {
-                        autoDone.insert(t.id)
-                    }
-                }
-            }
-        }
-        prevCPU = cpu
-        prevTime = now
-        applyNet(now: now)
+        // Real elapsed time, not the nominal second: if the run loop was starved the
+        // drained bytes cover the whole gap, and dividing them by 1 s would turn an
+        // idle app's keepalive trickle into a "working" burst.
+        let dt = lastTick.map { max(0.25, now.timeIntervalSince($0)) } ?? 1
+        lastTick = now
+        applyNet(now: now, dt: dt)
         publish(now: now)
     }
 
@@ -672,6 +587,7 @@ final class StatusMonitor {
     // a turn in progress; a quiet stretch = it finished. Coarser than the AX
     // stop-button (it can't name the session or pinpoint the exact boundary), but it
     // works in exactly the case AX is blind, so it is the fallback of choice there.
+    // `defaults write com.dd.notchdial statusNet -bool false` turns it off.
     var netEnabled = true
     var netOnRate: Double = 800     // bytes/sec sustained to count as working
     var netHotNeeded = 2            // consecutive samples above the rate
@@ -695,8 +611,8 @@ final class StatusMonitor {
             let rate = Double(bytes[t.id] ?? 0) / max(0.001, dt)
             // AX owns an app it can read; the network signal is only for the dark case.
             // The frontmost app is being *used* (its own UI traffic), not necessarily
-            // working, so it never auto-triggers — same rule as the CPU fallback.
-            if axUsable.contains(t.id) || front == t.path {
+            // working, so it never auto-triggers. A quit app has no traffic to read.
+            if axUsable.contains(t.id) || front == t.path || !isRunning(t) {
                 netHot[t.id] = 0
                 if netWorking.contains(t.id) { netWorking.remove(t.id) }
                 continue
@@ -727,12 +643,11 @@ final class StatusMonitor {
     private func publish(now: Date = Date()) {
         var out: [Int: WorkState] = [:]
         let front = frontmostBundlePath()
+        let names = listStatusDir()
         for t in kTargets {
-            let fs = fileState(t)
+            let fs = fileState(t, in: names)
             // where AX can read the app's UI it is the only signal that counts
-            let guessWorking = axUsable.contains(t.id)
-                ? false
-                : (autoWorking.contains(t.id) || hbActive.contains(t.id) || netWorking.contains(t.id))
+            let guessWorking = !axUsable.contains(t.id) && netWorking.contains(t.id)
             let live = axBusy.contains(t.id) || guessWorking
             var s: WorkState = .idle
             if fs == .working || live { s = .working }
@@ -765,42 +680,6 @@ final class StatusMonitor {
             onChange?(states)
             onTimes?(since)
         }
-    }
-
-    // cumulative CPU seconds per target's process tree — pure syscalls, nothing spawned.
-    // Processes are matched by executable-path prefix: every helper of an app bundle
-    // (Electron renderers, XPC services) lives under <bundle>.app/…
-    static func cpuSecondsByTarget() -> [Int: Double] {
-        var tb = mach_timebase_info_data_t()
-        mach_timebase_info(&tb)
-        let toSec = Double(tb.numer) / Double(tb.denom) / 1_000_000_000
-        var n = proc_listallpids(nil, 0)
-        guard n > 0 else { return [:] }
-        var pids = [Int32](repeating: 0, count: Int(n) + 64)
-        n = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<Int32>.size))
-        guard n > 0 else { return [:] }
-        var res: [Int: Double] = [:]
-        var buf = [CChar](repeating: 0, count: 4096)
-        for i in 0..<Int(n) {
-            let pid = pids[i]
-            guard pid > 0 else { continue }
-            let len = proc_pidpath(pid, &buf, UInt32(buf.count))
-            guard len > 0 else { continue }
-            let path = String(cString: buf)
-            for t in kTargets where path.hasPrefix(t.path + "/") {
-                var ru = rusage_info_current()
-                let ok = withUnsafeMutablePointer(to: &ru) { p in
-                    p.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
-                        proc_pid_rusage(pid, RUSAGE_INFO_CURRENT, $0)
-                    }
-                }
-                if ok == 0 {
-                    res[t.id, default: 0] += Double(ru.ri_user_time &+ ru.ri_system_time) * toSec
-                }
-                break
-            }
-        }
-        return res
     }
 }
 

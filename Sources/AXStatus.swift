@@ -99,13 +99,7 @@ enum AXStatus {
         lastFull[pid] = nil; lastDiscover[pid] = nil; emptyStreak[pid] = nil
         lock.unlock()
     }
-    static func forgetActivation(pid: pid_t) { forget(pid: pid) }
-
     // MARK: element helpers
-    /// Last error from the root read, so an empty tree can name its own cause:
-    /// a real denial (-25204/-25211) looks nothing like a genuinely bare app.
-    static var lastRootError: AXError = .success
-
     private static func copy(_ el: AXUIElement, _ attr: CFString) -> CFTypeRef? {
         var v: CFTypeRef?
         guard AXUIElementCopyAttributeValue(el, attr, &v) == .success else { return nil }
@@ -243,10 +237,6 @@ enum AXStatus {
     /// Floor between full walks. The cached row carries the signal at 1 Hz; walking
     /// is only for (re)finding it, and must stay rare enough to be harmless.
     static var fullScanEvery: TimeInterval = 4
-    static func forgetRows() {
-        rowCache = [:]; scopeCache = [:]; composerCache = [:]; webAreaCache = [:]
-        lastFull = [:]; lastDiscover = [:]; emptyStreak = [:]
-    }
     private static var lastDiscover: [pid_t: Date] = [:]
     /// Consecutive walks that came back with nothing at all. Chromium switches its
     /// accessibility tree back OFF when it decides no assistive client is listening,
@@ -379,8 +369,15 @@ enum AXStatus {
             lock.lock(); webAreaCache[pid] = nil; lock.unlock()
         }
         guard let comp = comp else { return }
+        // A cached element that Electron has since re-rendered away still *counts* as
+        // a node when walked from (the root is tallied before anything is read), so
+        // "nodes > 0" could never fail and a dead composer kept answering "checked,
+        // no interrupt control" for the rest of the session — which settled the open
+        // session the moment its sidebar row went quiet for a tool call: a ✓ mid-turn,
+        // then a spinner again, once per tool call. The composer is a container; a
+        // live one has children. Anything less is a dead element, and we look again.
         let scan = walk(from: [comp], pid: pid, budget: 260)
-        guard scan.nodes > 0 else {
+        guard scan.nodes > 1 else {
             lock.lock(); composerCache[pid] = nil; lock.unlock()
             return
         }
@@ -397,8 +394,14 @@ enum AXStatus {
         if m[name] == nil && m.count >= maxWatchedRows { lock.unlock(); return }
         m[name] = el
         rowCache[pid] = m
-        if scopeCache[pid] == nil { let a = ancestor(el, up: 4); scopeCache[pid] = a }
+        let needScope = scopeCache[pid] == nil
         lock.unlock()
+        // The ancestor lookup is four synchronous IPC round-trips into the app, each
+        // with a 0.4 s timeout. Not under the lock: the main thread takes it to press
+        // a row or forget a pid, and a slow app must never make the island wait.
+        guard needScope else { return }
+        let a = ancestor(el, up: 4)
+        lock.lock(); if scopeCache[pid] == nil { scopeCache[pid] = a }; lock.unlock()
     }
 
     private static func walk(from roots: [AXUIElement], pid: pid_t, budget: Int) -> Probe {
@@ -415,8 +418,12 @@ enum AXStatus {
         while !level.isEmpty, depth < maxDepth, p.nodes < budget {
             var next: [AXUIElement] = []
             for el in level {
-                p.nodes += 1
+                // The budget is a count of nodes examined; the one that would exceed
+                // it is the one we stop at, unexamined, and only then is the walk
+                // incomplete. (Stopping *at* the budget left a tree of exactly that
+                // size reported as "could not tell" after it had all been read.)
                 if p.nodes >= budget { p.complete = false; break }
+                p.nodes += 1
                 let r = role(el)
                 if r == "AXWebArea", p.openSession == nil, let t = string(el, "AXTitle"),
                    let n = openSessionName(t) {

@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 // MARK: - Network-inbound signal (works exactly where the Accessibility tree does not)
 //
@@ -18,51 +19,105 @@ import Foundation
 // The bytes come from one long-lived `nettop` process (the same private
 // NetworkStatistics source Activity Monitor uses), parsed as a stream. One process,
 // not a spawn per sample — spawning nettop repeatedly costs seconds.
+//
+// Which app a row belongs to is decided by the process's executable path, not its
+// name. Electron's traffic flows through helpers ("Claude Helper", "Codex (Service)",
+// the `codex` binary ChatGPT ships in its Resources), nettop truncates names to 15
+// characters ("Cursor Helper (.88406"), and the `claude` command-line tool is a
+// different program that happens to share a name with the app. Every helper of an
+// app bundle lives under <bundle>.app/, so a pid resolves to exactly one target.
 final class NetMonitor {
     /// bytes accumulated per target id since the last drain()
     private var bytesSince: [Int: Int] = [:]
-    /// last cumulative reading per "Name.pid" identity, to turn nettop's running
-    /// totals into deltas and to survive a pid joining/leaving the sample set
-    private var lastCum: [String: Int] = [:]
+    /// last cumulative reading per pid, to turn nettop's running totals into deltas
+    private var lastCum: [pid_t: Int] = [:]
+    /// pid → target id, resolved once from the executable path; nil = not one of ours
+    private var owner: [pid_t: Int?] = [:]
+    /// when each pid last appeared, so the tables forget processes that are gone
+    private var lastSeen: [pid_t: Date] = [:]
+    private var lastPrune = Date()
     private let lock = NSLock()
     private var proc: Process?
     private var buf = Data()
-    /// name → target id, e.g. "chatgpt" → 0. Lowercased for a case-insensitive contains.
-    private let matchers: [(needle: String, id: Int)]
+    /// bundle path + "/" per target: the prefix every one of its executables shares
+    private let prefixes: [(id: Int, prefix: String)]
+    /// Executable path of a pid. proc_pidpath by default; the self-test injects.
+    private let pathOf: (pid_t) -> String?
+    /// How long a pid may be absent from the stream before its tables are dropped.
+    static let forgetAfter: TimeInterval = 120
 
-    init(targets: [AppTarget]) {
-        matchers = targets.map { (($0.path as NSString).lastPathComponent
-            .replacingOccurrences(of: ".app", with: "").lowercased(), $0.id) }
+    init(targets: [AppTarget], pathOf: ((pid_t) -> String?)? = nil) {
+        prefixes = targets.map { ($0.id, $0.path.hasSuffix("/") ? $0.path : $0.path + "/") }
+        self.pathOf = pathOf ?? NetMonitor.executablePath
+    }
+
+    static func executablePath(_ pid: pid_t) -> String? {
+        var buf = [CChar](repeating: 0, count: 4096)
+        let n = proc_pidpath(pid, &buf, UInt32(buf.count))
+        return n > 0 ? String(cString: buf) : nil
     }
 
     /// Parse one nettop line: "<time> <Name>.<pid>   <cumulativeBytesIn>".
-    /// Returns the process identity (Name.pid) and the cumulative byte count.
+    /// Returns the pid and the cumulative byte count. The name is whatever nettop
+    /// felt like printing (truncated, with spaces and dots); only the pid is trusted.
     /// Pure and total, so the selftest can hammer it without a live nettop.
-    static func parse(_ line: String) -> (identity: String, bytes: Int)? {
+    static func parse(_ line: String) -> (pid: pid_t, bytes: Int)? {
         let parts = line.split(separator: " ", omittingEmptySubsequences: true)
         guard parts.count >= 3, let bytes = Int(parts[parts.count - 1]) else { return nil }
         // drop the leading timestamp; the identity is everything up to the number
-        let mid = parts[1..<(parts.count - 1)].joined(separator: " ")
-        return mid.isEmpty ? nil : (mid, bytes)
+        let identity = parts[1..<(parts.count - 1)].joined(separator: " ")
+        guard let dot = identity.lastIndex(of: "."),
+              let pid = pid_t(identity[identity.index(after: dot)...]), pid > 0 else { return nil }
+        return (pid, bytes)
+    }
+
+    /// Which target a pid belongs to, cached. Exposed for the selftest.
+    func target(of pid: pid_t) -> Int? {
+        lock.lock()
+        if let known = owner[pid] { lock.unlock(); return known }
+        lock.unlock()
+        let path = pathOf(pid)
+        let id = path.flatMap { p in prefixes.first { p.hasPrefix($0.prefix) }?.id }
+        lock.lock(); owner[pid] = .some(id); lock.unlock()
+        return id
     }
 
     /// Fold one line into the per-target accumulators. Exposed for the selftest.
-    func ingest(_ line: String) {
-        guard let (identity, cum) = Self.parse(line) else { return }
-        let low = identity.lowercased()
-        guard let m = matchers.first(where: { low.contains($0.needle) }) else { return }
+    func ingest(_ line: String, now: Date = Date()) {
+        guard let (pid, cum) = Self.parse(line) else { return }
         lock.lock()
-        let prev = lastCum[identity]
-        lastCum[identity] = cum
-        // A running total only ever grows; a drop means nettop recycled the row
-        // (pid gone / counters reset), which is not inbound traffic.
-        if let prev = prev, cum >= prev { bytesSince[m.id, default: 0] += cum - prev }
+        lastSeen[pid] = now
+        let prev = lastCum[pid]
+        lock.unlock()
+        // A running total only ever grows. A drop means the pid was recycled — a new
+        // process, possibly a different program, so its owner is re-resolved too — or
+        // nettop reset its counters; either way it is not inbound traffic.
+        if let prev = prev, cum < prev {
+            lock.lock(); owner[pid] = nil; lastCum[pid] = cum; lock.unlock()
+            return
+        }
+        guard let id = target(of: pid) else {
+            lock.lock(); lastCum[pid] = cum; lock.unlock()
+            return
+        }
+        lock.lock()
+        lastCum[pid] = cum
+        // only growth is traffic; a zero delta must not conjure a "0 bytes" entry
+        if let prev = prev, cum > prev { bytesSince[id, default: 0] += cum - prev }
         lock.unlock()
     }
 
     /// Bytes since the previous drain, per target id, and reset. Called once a tick.
-    func drain() -> [Int: Int] {
-        lock.lock(); let out = bytesSince; bytesSince = [:]; lock.unlock()
+    func drain(now: Date = Date()) -> [Int: Int] {
+        lock.lock()
+        let out = bytesSince; bytesSince = [:]
+        if now.timeIntervalSince(lastPrune) > 30 {
+            lastPrune = now
+            for (pid, seen) in lastSeen where now.timeIntervalSince(seen) > Self.forgetAfter {
+                lastSeen[pid] = nil; lastCum[pid] = nil; owner[pid] = nil
+            }
+        }
+        lock.unlock()
         return out
     }
 
@@ -104,19 +159,7 @@ final class NetMonitor {
             // Empty data is EOF (nettop exited). Drop the handler, or *this* loop
             // becomes the spinner: an EOF'd pipe is readable forever too.
             guard !d.isEmpty else { fh.readabilityHandler = nil; return }
-            guard let self = self else { return }
-            self.lock.lock(); self.buf.append(d); let chunk = self.buf; self.buf = Data(); self.lock.unlock()
-            guard var text = String(data: chunk, encoding: .utf8) else { return }
-            // keep an unfinished last line in the buffer
-            var tail = ""
-            if !text.hasSuffix("\n"), let nl = text.lastIndex(of: "\n") {
-                tail = String(text[text.index(after: nl)...])
-                text = String(text[...nl])
-            } else if !text.hasSuffix("\n") {
-                tail = text; text = ""
-            }
-            if !tail.isEmpty { self.lock.lock(); self.buf = Data(tail.utf8) + self.buf; self.lock.unlock() }
-            for line in text.split(separator: "\n") { self.ingest(String(line)) }
+            self?.feed(d)
         }
         p.terminationHandler = { [weak self] dead in
             out.fileHandleForReading.readabilityHandler = nil
@@ -137,6 +180,21 @@ final class NetMonitor {
         }
     }
 
+    /// Split the stream into lines at newline *bytes*, and only then decode. Decoding
+    /// the raw chunk first threw the whole read away whenever a pipe boundary fell
+    /// inside a multi-byte character — a non-ASCII process name was enough.
+    func feed(_ d: Data) {
+        lock.lock()
+        buf.append(d)
+        guard let nl = buf.lastIndex(of: 0x0A) else { lock.unlock(); return }
+        let complete = buf[buf.startIndex...nl]
+        buf = Data(buf[buf.index(after: nl)...])
+        lock.unlock()
+        for line in complete.split(separator: 0x0A) where !line.isEmpty {
+            ingest(String(decoding: line, as: UTF8.self))
+        }
+    }
+
     /// True while a nettop child is alive.
     var isRunning: Bool { lock.lock(); defer { lock.unlock() }; return proc != nil }
 
@@ -144,12 +202,17 @@ final class NetMonitor {
         lock.lock()
         let p = proc; proc = nil
         bytesSince = [:]; lastCum = [:]; buf = Data()
+        nextLaunch = .distantPast      // a deliberate stop/start must not wait out the gap
         lock.unlock()
+        guard let p = p else { return }
         // terminate before the stdin pipe is released: a still-alive nettop that
         // suddenly sees EOF on stdin is exactly the spinner described above
-        p?.terminationHandler = nil
-        p?.terminate()
-        p?.waitUntilExit()
+        p.terminationHandler = nil
+        p.terminate()
+        // bounded: a child that ignores SIGTERM does not get to hang the main thread
+        let deadline = Date().addingTimeInterval(1)
+        while p.isRunning, Date() < deadline { usleep(20_000) }
+        if p.isRunning { kill(p.processIdentifier, SIGKILL); p.waitUntilExit() }
         lock.lock(); stdinHold = nil; lock.unlock()
     }
 }
