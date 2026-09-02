@@ -111,6 +111,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         flightTimer = tm
     }
 
+    /// One NotchDial at a time. A redeploy launches the new build while the old one is
+    /// still running; two copies then fight over the notch — and each runs its own
+    /// helpers (the nettop stream), so a leak in one is a leak times two. The newest
+    /// launch wins: ask the others to quit, force it if they haven't within 3s.
+    func retireOtherInstances() {
+        guard let bid = Bundle.main.bundleIdentifier else { return }
+        let me = ProcessInfo.processInfo.processIdentifier
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
+            .filter { $0.processIdentifier != me }
+        guard !others.isEmpty else { return }
+        for o in others { o.terminate() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            for o in others where !o.isTerminated { o.forceTerminate() }
+        }
+    }
+
+    /// Take the helper processes down with us. nettop would die on its own on the
+    /// next write to a closed pipe, but "would" is not a guarantee we want to test.
+    func applicationWillTerminate(_ note: Notification) {
+        statusMon.stop()
+    }
+
     func applicationDidFinishLaunching(_ note: Notification) {
         UserDefaults.standard.register(defaults: ["statusEnabled": true])
         if UserDefaults.standard.object(forKey: "lastIndex") != nil {
@@ -165,6 +187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if CommandLine.arguments.contains("--cpuprobe") { runCpuProbe(); return }
         if CommandLine.arguments.contains("--axprobe") { runAxProbe(dump: false); return }
         if CommandLine.arguments.contains("--axdump") { runAxProbe(dump: true); return }
+        retireOtherInstances()
         rebuildPanel()
         setupStatusItem()
         statusMon.onChange = { [weak self] st in self?.state.work = st }

@@ -686,6 +686,8 @@ final class StatusMonitor {
 
     func applyNet(now: Date, bytesOverride: [Int: Int]? = nil, dt: TimeInterval = 1) {
         guard netEnabled else { return }
+        // relaunch a nettop that died (no-op while it runs; rate-limited inside)
+        if bytesOverride == nil { net?.start() }
         let bytes = bytesOverride ?? net?.drain() ?? [:]
         netLastBytes = bytes
         let front = frontmostBundlePath()

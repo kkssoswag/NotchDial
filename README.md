@@ -125,6 +125,13 @@ So NotchDial reads the truth instead, in this order:
    AX stop-button — it can't name the session or pin the exact boundary — but it
    works where AX can't. Toggle: `defaults write com.dd.notchdial statusNet -bool false`.
 
+   Cost: the nettop child sits at ~0.4% CPU. It **must** be launched with an idle
+   pipe on stdin — nettop keeps an interactive key loop even in `-x -l 0` mode, and
+   with `/dev/null` (what a launchd-started GUI app hands its children) that loop
+   spins at 120%+ CPU forever. NotchDial does this; if you ever see a hot `nettop`
+   under it, that is the bug to look for. NotchDial also retires any other running
+   copy of itself on launch, so a redeploy can't stack two instances and two helpers.
+
 3. **File protocol (explicit — agents report themselves).** One word into one file:
 
    ```bash
@@ -231,7 +238,7 @@ Targets live in `Sources/Targets.swift` (name / bundle path / brand tint / plane
 
 ## Debug flags
 
-`--hovertest` drives the real cursor through the real trigger region and reports what the app actually did (run it after any hover change) · `--pin` keep expanded · `--snap out.png` offscreen snapshot · `--film dir/` frame-by-frame capture · `--selftest` gesture engine + hit-region + status state-machine tests · `--clicktest` synthesized-click hit-testing test · `--launchtest` measures click→app-activation latency · `--teartest` real tear-launch-retract cycle · `--demo <0|1|2>` scripted showcase run (for screen-recording demos) · `--statustest` scripted status choreography through the real file pipeline · `--cpuprobe` prints each target's measured CPU utilization over 4 s · `--axprobe` polls the Accessibility signal for 24 s (busy / nodes / ms per app) · `--axdump` lists every button label an app exposes, for tuning `AXStatus.busyPrefixes`
+`--pin` keep expanded · `--snap out.png` offscreen snapshot · `--film dir/` frame-by-frame capture · `--selftest` gesture engine + hit-region + status state-machine tests · `--clicktest` synthesized-click hit-testing test · `--launchtest` measures click→app-activation latency · `--teartest` real tear-launch-retract cycle · `--demo <0|1|2>` scripted showcase run (for screen-recording demos) · `--statustest` scripted status choreography through the real file pipeline · `--cpuprobe` prints each target's measured CPU utilization over 4 s · `--axprobe` polls the Accessibility signal for 24 s (busy / nodes / ms per app) · `--axdump` lists every button label an app exposes, for tuning `AXStatus.busyPrefixes`
 
 ## License
 

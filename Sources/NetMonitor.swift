@@ -66,20 +66,45 @@ final class NetMonitor {
         return out
     }
 
+    /// nettop's stdin. It MUST be a pipe we hold open and never write to.
+    ///
+    /// nettop keeps an interactive key loop even in `-x -l 0` logging mode. A GUI app
+    /// launched by launchd has /dev/null on fd 0, and a child inherits it; /dev/null
+    /// is *always readable* (instant EOF), so nettop's loop wakes, reads nothing,
+    /// and wakes again — forever. Measured on the real machine: stdin=/dev/null →
+    /// 121% CPU; stdin=an idle pipe → 0.4%. Two stacked NotchDial instances made
+    /// that two hot cores and a screaming fan for ninety minutes. Never again.
+    private var stdinHold: Pipe?
+    /// Earliest time another nettop may be launched — a crash loop must not spawn
+    /// a process a second.
+    private var nextLaunch = Date.distantPast
+    /// how often start() may relaunch a dead nettop
+    static let relaunchGap: TimeInterval = 30
+
+    /// Launch nettop, or relaunch it if it died. Cheap when it is already running,
+    /// so the monitor's tick can call this every second.
     func start() {
-        guard proc == nil else { return }
+        lock.lock()
+        let running = proc != nil
+        let tooSoon = Date() < nextLaunch
+        lock.unlock()
+        guard !running, !tooSoon else { return }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/nettop")
         // -P per-process · -x plain · -J bytes_in one column · -s 1 sample every 1s
         // · -l 0 stream forever. One process for the life of the app.
         p.arguments = ["-P", "-x", "-J", "bytes_in", "-s", "1", "-l", "0"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
+        let out = Pipe()
+        let hold = Pipe()          // see stdinHold
+        p.standardOutput = out
+        p.standardInput = hold
         p.standardError = FileHandle.nullDevice
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] fh in
-            guard let self = self else { return }
+        out.fileHandleForReading.readabilityHandler = { [weak self] fh in
             let d = fh.availableData
-            guard !d.isEmpty else { return }
+            // Empty data is EOF (nettop exited). Drop the handler, or *this* loop
+            // becomes the spinner: an EOF'd pipe is readable forever too.
+            guard !d.isEmpty else { fh.readabilityHandler = nil; return }
+            guard let self = self else { return }
             self.lock.lock(); self.buf.append(d); let chunk = self.buf; self.buf = Data(); self.lock.unlock()
             guard var text = String(data: chunk, encoding: .utf8) else { return }
             // keep an unfinished last line in the buffer
@@ -93,12 +118,38 @@ final class NetMonitor {
             if !tail.isEmpty { self.lock.lock(); self.buf = Data(tail.utf8) + self.buf; self.lock.unlock() }
             for line in text.split(separator: "\n") { self.ingest(String(line)) }
         }
-        do { try p.run(); proc = p }
-        catch { proc = nil }
+        p.terminationHandler = { [weak self] dead in
+            out.fileHandleForReading.readabilityHandler = nil
+            guard let self = self else { return }
+            self.lock.lock()
+            if self.proc === dead { self.proc = nil; self.stdinHold = nil }
+            self.lastCum = [:]; self.buf = Data()
+            self.lock.unlock()
+        }
+        lock.lock()
+        nextLaunch = Date().addingTimeInterval(Self.relaunchGap)
+        proc = p; stdinHold = hold
+        lock.unlock()
+        do { try p.run() }
+        catch {
+            out.fileHandleForReading.readabilityHandler = nil
+            lock.lock(); proc = nil; stdinHold = nil; lock.unlock()
+        }
     }
 
+    /// True while a nettop child is alive.
+    var isRunning: Bool { lock.lock(); defer { lock.unlock() }; return proc != nil }
+
     func stop() {
-        proc?.terminate(); proc = nil
-        lock.lock(); bytesSince = [:]; lastCum = [:]; buf = Data(); lock.unlock()
+        lock.lock()
+        let p = proc; proc = nil
+        bytesSince = [:]; lastCum = [:]; buf = Data()
+        lock.unlock()
+        // terminate before the stdin pipe is released: a still-alive nettop that
+        // suddenly sees EOF on stdin is exactly the spinner described above
+        p?.terminationHandler = nil
+        p?.terminate()
+        p?.waitUntilExit()
+        lock.lock(); stdinHold = nil; lock.unlock()
     }
 }
