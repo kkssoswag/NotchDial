@@ -76,6 +76,12 @@ final class StatusMonitor {
     private var axGeneration: UInt64 = 0
     private var axBusy: Set<Int> = []          // agents the UI says are working
     private var axUsable: Set<Int> = []        // apps whose AX tree we can actually read
+    private var axLastGood: [Int: Date] = [:]  // last sweep that actually read something
+    /// How long an app may go without a single readable sweep before we stop
+    /// treating AX as its source of truth and let the fallback back in. Long enough
+    /// to ride out a brief dark patch, short enough that a genuinely unreadable app
+    /// doesn't sit there frozen on a stale reading.
+    var axUsableTTL: TimeInterval = 12
     private var axStart: [Int: Date] = [:]
     /// A ✓ the user has not looked at yet. A new burst hides it behind the spinner,
     /// but must not *pay* it: if that burst is too short to earn a stamp of its own,
@@ -318,7 +324,7 @@ final class StatusMonitor {
         hot = [:]; cold = [:]; prevCPU = [:]; prevTime = nil; doneAt = [:]
         hbPrevSize = [:]; hbLastEvent = [:]; hbPrevEvent = [:]; hbActive = []; hbStart = [:]
         axBusy = []; axUsable = []; axStart = [:]; axOwed = []
-        axLive = [:]; axUnknownSince = [:]; since = [:]
+        axLive = [:]; axUnknownSince = [:]; since = [:]; axLastGood = [:]
         sessState = [:]; sessSince = [:]; sessions = [:]; quietSince = [:]; onSessions?([:])
         axGeneration &+= 1; axInFlight = false; axSweepStarted = nil
         if let o = activateObserver { NSWorkspace.shared.notificationCenter.removeObserver(o) }
@@ -425,7 +431,7 @@ final class StatusMonitor {
     /// suppresses the fallback signals. Either way the notch kept asserting
     /// something it had no way to still know.
     func forgetAX(_ id: Int) {
-        axUsable.remove(id); axBusy.remove(id); axOwed.remove(id)
+        axUsable.remove(id); axBusy.remove(id); axOwed.remove(id); axLastGood[id] = nil
         axLive[id] = nil; axStart[id] = nil; axUnknownSince[id] = nil; quietSince[id] = nil
         sessState[id] = nil; sessSince[id] = nil
         rebuildSessions()
@@ -534,11 +540,19 @@ final class StatusMonitor {
 
     func applyAX(_ res: [Int: AXRead], hits: [Int: String] = [:], now: Date) {
         for (id, r) in res {
-            // A cached single-element read is worth far more than a big walk, so
-            // usability can no longer be judged by node count alone — and a sweep we
-            // were not allowed to make says nothing about whether the app is readable.
-            if r.nodes >= 20 || !r.running.isEmpty || !r.settled.isEmpty { axUsable.insert(id) }
-            else if r.complete { axUsable.remove(id) }
+            // What counts as "we can read this app": a real tree, a cached row, or a
+            // named session. Each of those refreshes a timestamp.
+            let good = r.nodes >= 20 || !r.running.isEmpty || !r.settled.isEmpty
+            if good { axUsable.insert(id); axLastGood[id] = now }
+            else if r.complete { axUsable.remove(id); axLastGood[id] = nil }
+            // The bug that made status "never match": a truncated/empty read neither
+            // inserted nor removed, so once an app was usable it stayed authoritative
+            // FOREVER through blind sweeps — which also suppressed the fallback. So an
+            // app that has not produced a single readable sweep in axUsableTTL is no
+            // longer trusted as the source of truth, and the fallback can take over.
+            if let last = axLastGood[id], now.timeIntervalSince(last) >= axUsableTTL {
+                axUsable.remove(id); axLastGood[id] = nil; forgetAX(id)
+            }
             guard axUsable.contains(id) else { continue }
             let busy: Bool
             let v = verdict(id, r, now: now)

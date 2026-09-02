@@ -66,15 +66,26 @@ enum AXStatus {
     /// Cheap and idempotent, but only worth doing once per app launch.
     private static var activated: Set<pid_t> = []
     private static let lock = NSLock()
+    /// Assert "an assistive client is here" — EVERY sweep, not once. This is the
+    /// whole ballgame, and I had it wrong for days. Chromium keeps its web tree off
+    /// until it sees this attribute set, and re-evaluates continuously: set it once
+    /// and walk away, and the tree comes up for a moment and then Chromium decides
+    /// nobody is listening and tears it back down. Measured, that left the tree dark
+    /// ~82% of the time for a backgrounded app. Re-asserting it on every sweep (one
+    /// cheap IPC write, ~0ms) keeps the tree continuously alive and fast even in the
+    /// background — measured 7–66ms full reads, zero dropouts over minutes. The DoS I
+    /// once saw came from an unbounded *walk*, never from this write.
+    ///
+    /// Returns true the first time for a pid, so the caller can skip that one sweep's
+    /// read and let Chromium finish building the tree before we look.
     static func enableWebTree(pid: pid_t, force: Bool = false) -> Bool {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
         lock.lock()
         let fresh = force || !activated.contains(pid)
         activated.insert(pid)
         lock.unlock()
-        guard fresh else { return false }
-        let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
-        return true
+        return fresh
     }
     /// Drop everything keyed to a pid. macOS reuses pids, and every one of these
     /// caches is a promise about a process that no longer exists: `activated` would
@@ -333,20 +344,20 @@ enum AXStatus {
             lock.lock(); scopeCache[pid] = nil; lock.unlock()
         }
         lock.lock(); let streak = emptyStreak[pid] ?? 0; lock.unlock()
-        // Cap at five minutes, not one. When Chromium has torn its tree down, the
-        // only thing that brings it back is being left alone — measured: all three
-        // apps at windows=0 together, still zero after three minutes of NotchDial
-        // retrying, and back to windows=1 within a couple of minutes of nothing
-        // touching them. Retrying harder is not neutral; it is the thing keeping it
-        // down. Nobody is reading the notch during those minutes anyway.
-        let backoff = min(fullScanEvery * pow(2, Double(min(streak, 7))), 300)
+        // A gentle floor between full walks of an app that keeps coming back empty —
+        // 4s rising to at most 20s. The old cap was five minutes, on the theory that
+        // "retrying is what keeps the tree down." That theory was measured BEFORE we
+        // re-asserted AXManualAccessibility every sweep, when the retries were bare
+        // walks Chromium ignored. Now the re-assert IS the thing that brings the tree
+        // back, so a long dark stretch is no longer self-inflicted — it just means we
+        // are not looking. Keep the floor small so recovery is quick.
+        let backoff = min(fullScanEvery * pow(2, Double(min(streak, 3))), 20)
         if let last = last, Date().timeIntervalSince(last) < backoff {
             // Not allowed to walk yet, and nothing cached: say so honestly rather
             // than reporting an idle we did not actually observe.
             return Probe(busy: false, nodes: 0, ms: 0, hit: "", running: [], settled: [], complete: false)
         }
         lock.lock(); lastFull[pid] = Date(); lock.unlock()
-        if streak > 0 { _ = enableWebTree(pid: pid, force: true) }   // ask again; it may have hung up
         let roots: [AXUIElement] = copy(AXUIElementCreateApplication(pid), kWindows) as? [AXUIElement]
             ?? kids(AXUIElementCreateApplication(pid))
         var p = walk(from: roots, pid: pid, budget: maxNodes)
