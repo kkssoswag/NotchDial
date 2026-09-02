@@ -674,6 +674,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         tm2.forgetAX(0)
         tm2.applyAX([Int: StatusMonitor.AXRead](), now: tNow.addingTimeInterval(1))
         results.append(heldBefore && tm2.states[0] == nil ? "PASS 状态·失去授权即释放" : "FAIL 状态·失去授权即释放")
+
+        // ---- network fallback: the path that works where AX goes dark ------------
+        // nettop line parsing: "<time> <Name>.<pid>   <bytes>"
+        let np = NetMonitor.parse("16:34:35.721 Claude Helper.731                     18607952")
+        results.append(np?.identity == "Claude Helper.731" && np?.bytes == 18607952
+            ? "PASS 网络·解析行" : "FAIL 网络·解析行")
+        results.append(NetMonitor.parse("time                          bytes_in") == nil
+            ? "PASS 网络·表头不误解析" : "FAIL 网络·表头不误解析")
+        // cumulative → per-target deltas, matched by app name, pid churn clamped
+        let nm = NetMonitor(targets: kTargets)   // id0=ChatGPT id1=Cursor id2=Claude
+        nm.ingest("t ChatGPT Helper.900   1000")
+        nm.ingest("t Claude Helper.901   5000")
+        _ = nm.drain()                            // establish baselines
+        nm.ingest("t ChatGPT Helper.900   1000")  // ChatGPT idle: no growth
+        nm.ingest("t Claude Helper.901   9000")   // Claude +4000
+        let d = nm.drain()
+        results.append((d[0] ?? 0) == 0 && (d[2] ?? 0) == 4000
+            ? "PASS 网络·增量按 app 归并" : "FAIL 网络·增量按 app 归并")
+        nm.ingest("t Claude Helper.901   3000")   // counter reset (pid recycled) → clamp, not negative
+        results.append((nm.drain()[2] ?? 0) == 0
+            ? "PASS 网络·计数器回退夹到0" : "FAIL 网络·计数器回退夹到0")
+
+        // the working/quiet state machine, driven by injected byte counts
+        let xm = StatusMonitor()
+        xm.dirPath = NSTemporaryDirectory() + "nd-net-selftest-\(ProcessInfo.processInfo.processIdentifier)"
+        xm.axEnabled = false; xm.hbEnabled = false
+        xm.frontmostBundlePath = { "/nonexistent" }   // target is backgrounded
+        xm.netOnRate = 800; xm.netHotNeeded = 2; xm.netQuiet = 6; xm.minWorkForDone = 2
+        var xNow = Date(timeIntervalSince1970: 13_000_000)
+        func ntick(_ bytes: Int, _ step: TimeInterval = 1) {
+            xNow = xNow.addingTimeInterval(step)
+            xm.applyNet(now: xNow, bytesOverride: [0: bytes], dt: step)
+            xm.publishForTest(now: xNow)
+        }
+        ntick(3000); ntick(3000)                  // sustained inflow, 2 samples
+        results.append(xm.states[0] == .working ? "PASS 网络·持续入站→工作中" : "FAIL 网络·持续入站→工作中")
+        ntick(0); ntick(0); ntick(0); ntick(0); ntick(0); ntick(0); ntick(0)  // quiet past netQuiet
+        results.append(xm.states[0] == .done ? "PASS 网络·静默够久→收工" : "FAIL 网络·静默够久→收工")
+        // a single blip is not a turn
+        let ym = StatusMonitor()
+        ym.dirPath = NSTemporaryDirectory() + "nd-net2-selftest-\(ProcessInfo.processInfo.processIdentifier)"
+        ym.axEnabled = false; ym.hbEnabled = false
+        ym.frontmostBundlePath = { "/nonexistent" }
+        ym.netOnRate = 800; ym.netHotNeeded = 2
+        var yNow = Date(timeIntervalSince1970: 14_000_000)
+        yNow = yNow.addingTimeInterval(1); ym.applyNet(now: yNow, bytesOverride: [0: 5000], dt: 1); ym.publishForTest(now: yNow)
+        yNow = yNow.addingTimeInterval(1); ym.applyNet(now: yNow, bytesOverride: [0: 0], dt: 1); ym.publishForTest(now: yNow)
+        results.append(ym.states[0] == nil ? "PASS 网络·单次脉冲不误报" : "FAIL 网络·单次脉冲不误报")
         // One app, several sessions. The probe used to stop at the first live row, so
         // whichever one finished first stamped ✓ for the whole app while the others
         // were still going — measured live with two Claude sessions running.

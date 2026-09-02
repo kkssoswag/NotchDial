@@ -54,6 +54,7 @@ final class StatusMonitor {
     // behind `defaults write com.dd.notchdial statusHeartbeat -bool true` only for
     // apps that persist locally in a way that really does track their work.
     var hbEnabled = UserDefaults.standard.bool(forKey: "statusHeartbeat")
+    private lazy var net: NetMonitor? = NetMonitor(targets: kTargets)
     var hbGrowthOn: UInt64 = 256          // bytes of growth that count as one commit event
     var hbEventGap: TimeInterval = 6      // two commits this close together = live session
     var hbBigCommit: UInt64 = 4096        // a single commit this large latches instantly (the send itself)
@@ -292,6 +293,8 @@ final class StatusMonitor {
         let tm = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(tm, forMode: .common)
         timer = tm
+        if netEnabled, UserDefaults.standard.object(forKey: "statusNet") as? Bool ?? true { net?.start() }
+        else { netEnabled = false }
         log("START axEnabled=\(axEnabled) trusted=\(AXStatus.trusted()) hb=\(hbEnabled) hbDirs=\(hbDir.count) pids=\(kTargets.compactMap { AXStatus.pid(for: $0) })")
         // Exact status needs one Accessibility grant. Ask once, ever; the menu item
         // stays available for later. Without it we quietly fall back to guessing.
@@ -320,6 +323,8 @@ final class StatusMonitor {
 
     func stop() {
         timer?.invalidate(); timer = nil
+        net?.stop()
+        netWorking = []; netHot = [:]; netLastActive = [:]; netStart = [:]
         states = [:]; autoWorking = []; autoDone = []
         hot = [:]; cold = [:]; prevCPU = [:]; prevTime = nil; doneAt = [:]
         hbPrevSize = [:]; hbLastEvent = [:]; hbPrevEvent = [:]; hbActive = []; hbStart = [:]
@@ -599,9 +604,13 @@ final class StatusMonitor {
                 return "\(k):\(v.openChecked ? (v.openBusy ? "STOP" : "idle") : "unchecked")/\(v.openSession == nil ? "?" : "named")"
             }.sorted()
             let opened = op.isEmpty ? " open=none" : " open=\(op)"
+            let nw = netWorking.isEmpty ? "" : " net=\(netWorking.sorted())"
+            // raw drained bytes for the apps AX can't read — proves the pipe is alive
+            let nb = netLastBytes.filter { $0.value > 0 && !axUsable.contains($0.key) }
+            let nbs = nb.isEmpty ? "" : " netB=\(nb.map { "\($0.key):\($0.value)" }.sorted())"
             let live = axLive.filter { !$0.value.isEmpty }
             let held = live.isEmpty ? "" : " live=\(live.map { "\($0.key):\(Self.redact($0.value.sorted().joined(separator: "|")))" }.sorted())"
-            log("AX res=\(res.map { "\($0.key):\($0.value.busy ? "BUSY" : "idle")/\($0.value.nodes)n\($0.value.complete ? "" : "~")" }.sorted()) usable=\(axUsable.sorted()) busy=\(axBusy.sorted())\(opened)\(held)\(why)")
+            log("AX res=\(res.map { "\($0.key):\($0.value.busy ? "BUSY" : "idle")/\($0.value.nodes)n\($0.value.complete ? "" : "~")" }.sorted()) usable=\(axUsable.sorted()) busy=\(axBusy.sorted())\(opened)\(nw)\(nbs)\(held)\(why)")
         }
         rebuildSessions()
         publish(now: now)
@@ -654,8 +663,64 @@ final class StatusMonitor {
         }
         prevCPU = cpu
         prevTime = now
+        applyNet(now: now)
         publish(now: now)
     }
+
+    // MARK: network fallback — tokens streaming in from the cloud, which the a11y
+    // tree cannot see once a backgrounded app has torn it down. Sustained inbound =
+    // a turn in progress; a quiet stretch = it finished. Coarser than the AX
+    // stop-button (it can't name the session or pinpoint the exact boundary), but it
+    // works in exactly the case AX is blind, so it is the fallback of choice there.
+    var netEnabled = true
+    var netOnRate: Double = 800     // bytes/sec sustained to count as working
+    var netHotNeeded = 2            // consecutive samples above the rate
+    var netQuiet: TimeInterval = 6  // silence before we call the turn finished
+    private var netHot: [Int: Int] = [:]
+    private var netWorking: Set<Int> = []
+    private var netLastActive: [Int: Date] = [:]
+    private var netStart: [Int: Date] = [:]
+
+    /// last drained bytes, for the diagnostic log only
+    private(set) var netLastBytes: [Int: Int] = [:]
+
+    func applyNet(now: Date, bytesOverride: [Int: Int]? = nil, dt: TimeInterval = 1) {
+        guard netEnabled else { return }
+        let bytes = bytesOverride ?? net?.drain() ?? [:]
+        netLastBytes = bytes
+        let front = frontmostBundlePath()
+        for t in kTargets {
+            let rate = Double(bytes[t.id] ?? 0) / max(0.001, dt)
+            // AX owns an app it can read; the network signal is only for the dark case.
+            // The frontmost app is being *used* (its own UI traffic), not necessarily
+            // working, so it never auto-triggers — same rule as the CPU fallback.
+            if axUsable.contains(t.id) || front == t.path {
+                netHot[t.id] = 0
+                if netWorking.contains(t.id) { netWorking.remove(t.id) }
+                continue
+            }
+            if rate >= netOnRate {
+                netHot[t.id, default: 0] += 1
+                netLastActive[t.id] = now
+                if !netWorking.contains(t.id), netHot[t.id, default: 0] >= netHotNeeded {
+                    netWorking.insert(t.id); netStart[t.id] = now; autoDone.remove(t.id)
+                }
+            } else {
+                netHot[t.id] = 0
+                if netWorking.contains(t.id) {
+                    let quietFor = now.timeIntervalSince(netLastActive[t.id] ?? now)
+                    if quietFor >= netQuiet {
+                        netWorking.remove(t.id)
+                        if now.timeIntervalSince(netStart[t.id] ?? now) >= minWorkForDone {
+                            autoDone.insert(t.id)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func publishForTest(now: Date) { publish(now: now) }
 
     private func publish(now: Date = Date()) {
         var out: [Int: WorkState] = [:]
@@ -665,7 +730,7 @@ final class StatusMonitor {
             // where AX can read the app's UI it is the only signal that counts
             let guessWorking = axUsable.contains(t.id)
                 ? false
-                : (autoWorking.contains(t.id) || hbActive.contains(t.id))
+                : (autoWorking.contains(t.id) || hbActive.contains(t.id) || netWorking.contains(t.id))
             let live = axBusy.contains(t.id) || guessWorking
             var s: WorkState = .idle
             if fs == .working || live { s = .working }

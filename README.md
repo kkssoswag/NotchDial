@@ -110,6 +110,21 @@ So NotchDial reads the truth instead, in this order:
    Cursor (`~/.cursor/hooks.json`: `beforeSubmitPrompt` / `stop`) can drive the same
    file protocol below.
 
+3.5. **Network inflow (the fallback for a backgrounded app AX went blind on).**
+   A long-idle backgrounded Electron app tears its accessibility tree down, and
+   neither re-asserting `AXManualAccessibility` nor a brief foreground revives it —
+   so signal 1 goes dark in exactly the case that matters, "I switched away, tell me
+   when it finishes". Tokens arriving from the cloud do not care about the a11y tree:
+   while a turn streams, bytes come in over the websocket; between turns they don't.
+   Measured, the separation is clean — idle apps show **zero** inbound bytes, an
+   active session shows KB-scale bursts (CPU, by contrast, is noise: an idle app
+   spiked to 51%). NotchDial reads per-app inbound bytes from one long-lived `nettop`
+   stream and treats sustained inflow (>800 B/s for a couple of seconds) as working,
+   a quiet stretch as finished. It only speaks for an app AX cannot currently read,
+   and never for the frontmost app (its own UI traffic isn't work). Coarser than the
+   AX stop-button — it can't name the session or pin the exact boundary — but it
+   works where AX can't. Toggle: `defaults write com.dd.notchdial statusNet -bool false`.
+
 3. **File protocol (explicit — agents report themselves).** One word into one file:
 
    ```bash
