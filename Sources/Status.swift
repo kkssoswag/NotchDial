@@ -243,9 +243,12 @@ final class StatusMonitor {
     static let logPath = (logDir as NSString).appendingPathComponent("status.log")
     private static let logMaxBytes = 4 << 20
     private var logHandle: FileHandle?
+    /// The self-test builds a dozen monitors; their chatter has no business in the
+    /// log the real one keeps, where it reads like handovers that never happened.
+    var logEnabled = true
     func logExternal(_ s: String) { log(s) }
     private func log(_ s: String) {
-        guard Self.debug else { return }
+        guard Self.debug, logEnabled else { return }
         guard let d = "\(Self.stamper.string(from: Date())) \(s)\n".data(using: .utf8) else { return }
         if logHandle == nil {
             try? FileManager.default.createDirectory(atPath: Self.logDir, withIntermediateDirectories: true,

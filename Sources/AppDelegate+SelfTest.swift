@@ -70,7 +70,7 @@ extension AppDelegate {
         // suite can run beside the real app without sweeping (or disturbing) anything.
         func isolated() -> StatusMonitor {
             let m = StatusMonitor()
-            m.axEnabled = false; m.netEnabled = false
+            m.axEnabled = false; m.netEnabled = false; m.logEnabled = false
             m.isRunning = { _ in true }
             m.frontmostBundlePath = { nil }
             return m
