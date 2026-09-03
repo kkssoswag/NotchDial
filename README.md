@@ -18,7 +18,7 @@ https://github.com/user-attachments/assets/39c76579-0f78-4b29-822e-a5045ef01156
 
 ## 🟢 Live agent status in the notch
 
-Kick off a long agent run, switch away, and glance at the notch: while an agent works, the black bar grows past the notch — the working apps' icons fan out as an overlapping deck on the left, and a single aggregate glyph sits on the right (spinner while anyone is still working, rubber stamp once they're all done). Each extra agent costs only the overlap step, so the bar stays compact no matter how many are running. When the task finishes, the spinner pops into a **green ✓ that stays until you actually switch to that app** (or it auto-clears a few seconds after you're already there). Expanded, each mode speaks its own dialect: a rubber-stamped ✓ on the paper ticket, a badge on the orbit icon, a neon tick under the sign.
+Kick off a long agent run, switch away, and glance at the notch: while an agent works, the black bar grows past the notch — the working apps' icons fan out as an overlapping deck on the left, and a single aggregate glyph sits on the right (spinner while anyone is still working, rubber stamp once they're all done). Each extra agent costs only the overlap step, so the bar stays compact no matter how many are running. When the task finishes, the spinner pops into a **green ✓ that stays until you actually switch to that app** (or it auto-clears a few seconds after you're already there). With several sessions in one app, each finished session is acknowledged on its own: clicking its ledger row, or sitting with that session open for a beat, clears that row and only that row — the others wait to be seen. Expanded, each mode speaks its own dialect: a rubber-stamped ✓ on the paper ticket, a badge on the orbit icon, a neon tick under the sign.
 
 The widened bar is itself a hover target, split by where you enter: glide in over the **notch** and you get the switcher, as always; glide in over the **widened part beside it** and the bar itself grows downward into a small status ledger — one continuous silhouette whose top corners flare out in concave curves, like it's growing out of the screen edge. One receipt row per **session** — its name, which agent it belongs to, and how long it has been running — separated by ticket perforation. **Click a row and that session comes to the front**, by pressing its own sidebar row rather than guessing at a URL scheme; the top strip still passes every click through to the menu bar, and the ledger retracts the moment you leave.
 
@@ -110,20 +110,27 @@ So NotchDial reads the truth instead, in this order:
    Cursor (`~/.cursor/hooks.json`: `beforeSubmitPrompt` / `stop`) can drive the same
    file protocol below.
 
-3.5. **Network inflow (the fallback for a backgrounded app AX went blind on).**
+3.5. **Network inflow (finishes a turn AX lost sight of — never starts one).**
    A long-idle backgrounded Electron app tears its accessibility tree down, and
    neither re-asserting `AXManualAccessibility` nor a brief foreground revives it —
-   so signal 1 goes dark in exactly the case that matters, "I switched away, tell me
-   when it finishes". Tokens arriving from the cloud do not care about the a11y tree:
-   while a turn streams, bytes come in over the websocket; between turns they don't.
-   Measured, the separation is clean — idle apps show **zero** inbound bytes, an
-   active session shows KB-scale bursts (CPU, by contrast, is noise: an idle app
-   spiked to 51%). NotchDial reads per-app inbound bytes from one long-lived `nettop`
-   stream and treats sustained inflow (>800 B/s for a couple of seconds) as working,
-   a quiet stretch as finished. It only speaks for an app AX cannot currently read,
-   and never for the frontmost app (its own UI traffic isn't work). Coarser than the
-   AX stop-button — it can't name the session or pin the exact boundary — but it
-   works where AX can't. Toggle: `defaults write com.dd.notchdial statusNet -bool false`.
+   so signal 1 can go dark mid-turn. Tokens arriving from the cloud do not care about
+   the a11y tree: while a turn streams, bytes come in over the websocket. NotchDial
+   reads per-app inbound bytes from one long-lived `nettop` stream, and when the tree
+   goes dark on a turn AX was watching, the turn is **handed over**: inflow keeps it
+   alive, a full minute of silence ends it and mints the stamp AX would have (a
+   minute, not seconds — a tool call is silent for its whole length). The sessions
+   AX had live ride along, so the ledger keeps its rows.
+
+   What the network may **not** do is start a turn. For a while it could, and it lied
+   constantly: over three working hours it lit up 27 times with no turn behind it —
+   Cursor syncing, ChatGPT phoning home — and minted twelve false ✓ on Cursor alone.
+   "The app is downloading something" is not "the agent is working", and there is no
+   threshold that separates them. So an app that was idle when its tree went dark
+   shows nothing, however much it downloads. The rule of the whole indicator: it may
+   miss a turn; it may not invent one. In the same spirit, AX itself has to say
+   "working" on **two consecutive sweeps** before the spinner appears — one sweep is
+   a rumour (a row caught mid-re-render), two a second apart is the app saying the
+   same thing twice. Toggle the network path: `defaults write com.dd.notchdial statusNet -bool false`.
 
    Cost: the nettop child sits at ~1% CPU. It **must** be launched with an idle pipe
    on stdin — nettop keeps an interactive key loop even in `-x -l 0` mode, and with

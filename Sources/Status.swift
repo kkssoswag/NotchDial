@@ -23,10 +23,8 @@ enum WorkState: Equatable { case idle, working, done }
 
 final class StatusMonitor {
     // tunables
-    var minWorkForDone: TimeInterval = 8   // a guessed burst shorter than this ends silently, not with a ✓
-    // The 8 s floor above exists to stop the *guessing* signal from stamping every
-    // traffic blip. The Accessibility signal is exact — a turn that really ran deserves
-    // its stamp however short it was, so it gets its own much lower floor.
+    // The Accessibility signal is exact — a turn that really ran deserves its stamp
+    // however short it was, so the floor below is only there to drop a one-sweep blip.
     var axMinWork: TimeInterval = 2
     var workingTTL: TimeInterval = 30 * 60 // stale "working" files are ignored (crashed agent)
     var doneTTL: TimeInterval = 12 * 3600
@@ -63,6 +61,18 @@ final class StatusMonitor {
     /// doesn't sit there frozen on a stale reading.
     var axUsableTTL: TimeInterval = 12
     private var axStart: [Int: Date] = [:]
+    /// Consecutive sweeps that must agree before an idle app is shown working. One
+    /// sweep is a rumour: a row caught mid-re-render, a label read as it changes.
+    /// Two in a row, a second apart, is the app telling us the same thing twice.
+    /// Costs one second of latency on the spinner; the ✓ path is unaffected.
+    var axConfirmSweeps = 2
+    private var axStreak: [Int: Int] = [:]
+    private var axStreakStart: [Int: Date] = [:]
+    /// The session on screen, as the web area last named it. This is how a finished
+    /// session gets acknowledged *individually*: you are in the app, that session is
+    /// the one you are looking at, and it stays that way for a beat.
+    private var lastOpen: [Int: String] = [:]
+    private var sessSeenAt: [Int: [String: Date]] = [:]
     /// A ✓ the user has not looked at yet. A new burst hides it behind the spinner,
     /// but must not *pay* it: if that burst is too short to earn a stamp of its own,
     /// the old one comes back. Without this, one flickering sweep right after a
@@ -280,10 +290,10 @@ final class StatusMonitor {
     func stop() {
         timer?.invalidate(); timer = nil
         net?.stop()
-        netWorking = []; netHot = [:]; netLastActive = [:]; netStart = [:]; netLastBytes = [:]
+        netWorking = []; netCarry = []; netLastActive = [:]; netStart = [:]; netLastBytes = [:]
         states = [:]; autoDone = []; doneAt = [:]; lastTick = nil
-        axBusy = []; axUsable = []; axStart = [:]; axOwed = []
-        axLive = [:]; axUnknownSince = [:]; since = [:]; axLastGood = [:]
+        axBusy = []; axUsable = []; axStart = [:]; axOwed = []; axStreak = [:]; axStreakStart = [:]
+        axLive = [:]; axUnknownSince = [:]; since = [:]; axLastGood = [:]; lastOpen = [:]; sessSeenAt = [:]
         sessState = [:]; sessSince = [:]; sessions = [:]; quietSince = [:]; onSessions?([:])
         axGeneration &+= 1; axSweepID &+= 1; axInFlight = false; axSweepStarted = nil; axWedged = false
         axWasTrusted = true
@@ -297,9 +307,27 @@ final class StatusMonitor {
         autoDone.remove(t.id)
         axOwed.remove(t.id)      // seen — the debt is paid
         for (n, s) in sessState[t.id] ?? [:] where s == .done { sessState[t.id]?[n] = nil; sessSince[t.id]?[n] = nil }
+        sessSeenAt[t.id] = nil
         rebuildSessions()
         doneAt[t.id] = nil
         removeFile(t)
+        publish()
+    }
+
+    /// The user has seen ONE session's ✓ — clicked its row, or sat with it open. Only
+    /// that row goes. The app's own stamp follows only when no other finished session
+    /// is still waiting to be seen: with three tasks in one app, jumping to the one
+    /// that finished must not silently acknowledge the other two.
+    func acknowledge(_ t: AppTarget, session: String?) {
+        guard let s = session else { clearDone(t); return }
+        guard sessState[t.id]?[s] == .done else { return }
+        sessState[t.id]?[s] = nil; sessSince[t.id]?[s] = nil; sessSeenAt[t.id]?[s] = nil
+        log("ACK id=\(t.id) session=\(Self.redact("s=" + s))")
+        let otherDone = (sessState[t.id] ?? [:]).values.contains(.done)
+        if !otherDone, !axBusy.contains(t.id), !netWorking.contains(t.id) {
+            autoDone.remove(t.id); axOwed.remove(t.id); doneAt[t.id] = nil; removeFile(t)
+        }
+        rebuildSessions()
         publish()
     }
 
@@ -365,8 +393,24 @@ final class StatusMonitor {
     func forgetAX(_ id: Int) {
         axUsable.remove(id); axBusy.remove(id); axOwed.remove(id); axLastGood[id] = nil
         axLive[id] = nil; axStart[id] = nil; axUnknownSince[id] = nil; quietSince[id] = nil
+        axStreak[id] = nil; axStreakStart[id] = nil; lastOpen[id] = nil; sessSeenAt[id] = nil
         sessState[id] = nil; sessSince[id] = nil
         rebuildSessions()
+    }
+
+    /// The tree went dark on a turn AX was watching. The turn does not stop existing
+    /// because we lost the ability to read it — so the network signal finishes it:
+    /// inbound bytes keep it alive, a long silence ends it and mints the stamp AX
+    /// would have. The sessions AX had live ride along, so the ledger keeps its rows.
+    /// An app that was *idle* when its tree went dark gets nothing: nothing started,
+    /// so there is nothing to finish, and the network is never allowed to invent one.
+    private func handOver(_ id: Int, start: Date, sessions: [(String, Date)], now: Date) {
+        netWorking.insert(id); netCarry.insert(id)
+        netStart[id] = start; netLastActive[id] = now
+        var st = sessState[id] ?? [:], sn = sessSince[id] ?? [:]
+        for (n, s) in sessions { st[n] = .working; sn[n] = s }
+        sessState[id] = st; sessSince[id] = sn
+        log("HANDOVER id=\(id) → network, sessions=\(sessions.count)")
     }
 
     /// The app is gone. Every signal about it goes with it — including the network
@@ -375,7 +419,7 @@ final class StatusMonitor {
     func targetTerminated(_ id: Int, pid: pid_t?) {
         if let p = pid { AXStatus.forget(pid: p) }
         forgetAX(id)
-        netWorking.remove(id); netHot[id] = 0; netLastActive[id] = nil; netStart[id] = nil
+        netWorking.remove(id); netCarry.remove(id); netLastActive[id] = nil; netStart[id] = nil
         autoDone.remove(id); doneAt[id] = nil
         log("TERMINATED id=\(id)")
         publish()
@@ -510,19 +554,37 @@ final class StatusMonitor {
             // one node, `axUsable` dropped, and the `continue` below skipped everything
             // that could have released `axBusy` — a spinner for the rest of the process.
             if let last = axLastGood[id], now.timeIntervalSince(last) >= axUsableTTL {
+                // A turn we were watching is handed to the network to finish (see
+                // handOver); everything else about the app is forgotten.
+                let carry: (Date, [(String, Date)])? = axBusy.contains(id)
+                    ? (axStart[id] ?? now,
+                       (sessState[id] ?? [:]).filter { $0.value == .working }
+                           .map { ($0.key, sessSince[id]?[$0.key] ?? now) })
+                    : nil
                 axUsable.remove(id); forgetAX(id)   // also clears axLastGood
+                if let c = carry { handOver(id, start: c.0, sessions: c.1, now: now) }
             }
             guard axUsable.contains(id) else { continue }
+            if let o = r.openSession { lastOpen[id] = o }
             let busy: Bool
             let v = verdict(id, r, now: now)
             applySessions(id, r, now: now)
             switch v {
             case .working:
-                busy = true
                 axUnknownSince[id] = nil
+                if axBusy.contains(id) { busy = true }
+                else {
+                    // Not yet shown working: the app has to say so twice in a row.
+                    let n = (axStreak[id] ?? 0) + 1
+                    axStreak[id] = n
+                    if n == 1 { axStreakStart[id] = now }
+                    guard n >= axConfirmSweeps else { continue }
+                    busy = true
+                }
             case .finished:
                 busy = false
                 axUnknownSince[id] = nil
+                axStreak[id] = 0
             case .unknown:
                 // Hold whatever we last knew — but not forever.
                 let since = axUnknownSince[id] ?? now
@@ -537,7 +599,7 @@ final class StatusMonitor {
             if busy {
                 if !axBusy.contains(id) {
                     axBusy.insert(id)
-                    axStart[id] = now
+                    axStart[id] = axStreakStart[id] ?? now   // the turn began at the first sweep, not the confirming one
                     if autoDone.contains(id) { axOwed.insert(id) }   // debt, not payment
                     autoDone.remove(id)
                 }
@@ -582,18 +644,27 @@ final class StatusMonitor {
         publish(now: now)
     }
 
-    // MARK: network fallback — tokens streaming in from the cloud, which the a11y
-    // tree cannot see once a backgrounded app has torn it down. Sustained inbound =
-    // a turn in progress; a quiet stretch = it finished. Coarser than the AX
-    // stop-button (it can't name the session or pinpoint the exact boundary), but it
-    // works in exactly the case AX is blind, so it is the fallback of choice there.
+    // MARK: network — finishes a turn AX lost sight of; never starts one.
+    // Tokens streaming in from the cloud are what the a11y tree cannot see once a
+    // backgrounded app has torn it down. For a while this signal was allowed to
+    // *start* a turn on its own, and it lied constantly: over three working hours it
+    // lit up 27 times with no turn behind it — Cursor syncing, ChatGPT phoning home —
+    // and minted twelve false stamps on Cursor alone. Sustained inflow is not a turn.
+    // What it can honestly say is "still streaming": so it only speaks for an app AX
+    // watched *begin* a turn and then went dark on (handOver), keeping that turn alive
+    // while bytes arrive and ending it after a long silence. An app that was idle when
+    // its tree went dark shows nothing, however much it downloads.
     // `defaults write com.dd.notchdial statusNet -bool false` turns it off.
     var netEnabled = true
-    var netOnRate: Double = 800     // bytes/sec sustained to count as working
-    var netHotNeeded = 2            // consecutive samples above the rate
-    var netQuiet: TimeInterval = 6  // silence before we call the turn finished
-    private var netHot: [Int: Int] = [:]
+    var netOnRate: Double = 800      // bytes/sec that count as "still streaming"
+    /// Silence before a handed-over turn is called finished. A tool call is silent
+    /// for its whole length and the sidebar is unreadable by then — so this is the
+    /// same minute a background session gets when we lose sight of it (bgSettleDelay),
+    /// not a six-second debounce. Late is fine; a ✓ in the middle of a turn is not.
+    var netQuiet: TimeInterval = 60
     private var netWorking: Set<Int> = []
+    /// Apps whose turn the network is finishing on AX's behalf (always ⊆ netWorking).
+    private var netCarry: Set<Int> = []
     private var netLastActive: [Int: Date] = [:]
     private var netStart: [Int: Date] = [:]
 
@@ -606,35 +677,25 @@ final class StatusMonitor {
         if bytesOverride == nil { net?.start() }
         let bytes = bytesOverride ?? net?.drain() ?? [:]
         netLastBytes = bytes
-        let front = frontmostBundlePath()
         for t in kTargets {
             let rate = Double(bytes[t.id] ?? 0) / max(0.001, dt)
-            // AX owns an app it can read; the network signal is only for the dark case.
-            // The frontmost app is being *used* (its own UI traffic), not necessarily
-            // working, so it never auto-triggers. A quit app has no traffic to read.
-            if axUsable.contains(t.id) || front == t.path || !isRunning(t) {
-                netHot[t.id] = 0
-                if netWorking.contains(t.id) { netWorking.remove(t.id) }
+            // AX can read the app again (or it quit): the network has nothing to add.
+            if axUsable.contains(t.id) || !isRunning(t) {
+                netWorking.remove(t.id); netCarry.remove(t.id)
                 continue
             }
-            if rate >= netOnRate {
-                netHot[t.id, default: 0] += 1
-                netLastActive[t.id] = now
-                if !netWorking.contains(t.id), netHot[t.id, default: 0] >= netHotNeeded {
-                    netWorking.insert(t.id); netStart[t.id] = now; autoDone.remove(t.id)
-                }
-            } else {
-                netHot[t.id] = 0
-                if netWorking.contains(t.id) {
-                    let quietFor = now.timeIntervalSince(netLastActive[t.id] ?? now)
-                    if quietFor >= netQuiet {
-                        netWorking.remove(t.id)
-                        if now.timeIntervalSince(netStart[t.id] ?? now) >= minWorkForDone {
-                            autoDone.insert(t.id)
-                        }
-                    }
-                }
-            }
+            // Never a trigger. Without a turn handed over by AX, bytes are just bytes.
+            guard netWorking.contains(t.id) else { continue }
+            if rate >= netOnRate { netLastActive[t.id] = now; continue }
+            guard now.timeIntervalSince(netLastActive[t.id] ?? now) >= netQuiet else { continue }
+            // Quiet for a whole minute: the turn AX saw begin is over, and it earned its stamp.
+            netWorking.remove(t.id); netCarry.remove(t.id)
+            autoDone.insert(t.id)
+            var st = sessState[t.id] ?? [:]
+            for (n, s) in st where s == .working { st[n] = .done; sessSince[t.id]?[n] = now }
+            sessState[t.id] = st
+            rebuildSessions()
+            log("NET QUIET id=\(t.id) → done after \(Int(now.timeIntervalSince(netStart[t.id] ?? now)))s")
         }
     }
 
@@ -664,11 +725,25 @@ final class StatusMonitor {
                     for (n, ss) in sessState[t.id] ?? [:] where ss == .done {
                         sessState[t.id]?[n] = nil; sessSince[t.id]?[n] = nil
                     }
+                    sessSeenAt[t.id] = nil
                     doneAt[t.id] = nil
                     s = .idle
                 }
             } else {
                 doneAt[t.id] = nil
+            }
+            // The app is still working on something else, and one of its finished
+            // sessions is the one on screen in front of you. Sitting with it for the
+            // same beat acknowledges that row — that row only; the others wait.
+            if s == .working, front == t.path, let o = lastOpen[t.id], sessState[t.id]?[o] == .done {
+                let at = sessSeenAt[t.id]?[o] ?? now
+                sessSeenAt[t.id, default: [:]][o] = at
+                if now.timeIntervalSince(at) >= doneLinger {
+                    sessState[t.id]?[o] = nil; sessSince[t.id]?[o] = nil; sessSeenAt[t.id]?[o] = nil
+                    rebuildSessions()
+                }
+            } else {
+                sessSeenAt[t.id] = nil
             }
             if s != .idle { out[t.id] = s }
         }

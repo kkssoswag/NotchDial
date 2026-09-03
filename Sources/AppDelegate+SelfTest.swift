@@ -125,7 +125,10 @@ extension AppDelegate {
         atick(true, nodes: 4)
         results.append(axm.states[0] == nil ? "PASS 状态·空AX树不采信" : "FAIL 状态·空AX树不采信")
         atick(true, nodes: 90)
-        results.append(axm.states[0] == .working ? "PASS 状态·AX→立刻工作中" : "FAIL 状态·AX→立刻工作中")
+        let oneSweep = axm.states[0]                    // one sweep is a rumour
+        atick(true, nodes: 90)
+        results.append(oneSweep == nil && axm.states[0] == .working
+            ? "PASS 状态·AX两次确认→工作中" : "FAIL 状态·AX两次确认→工作中(\(String(describing: oneSweep)),\(String(describing: axm.states[0])))")
         for _ in 0..<5 { atick(true, nodes: 90) }
         atick(false, nodes: 90)
         results.append(axm.states[0] == .done ? "PASS 状态·AX收工→出章" : "FAIL 状态·AX收工→出章")
@@ -143,9 +146,9 @@ extension AppDelegate {
         for _ in 0..<5 { atick(true, nodes: 90) }
         atick(false, nodes: 90)
         atick(true, nodes: 209, step: 1)
-        let hidden = axm.states[0] == .working
+        let untouched = axm.states[0] == .done          // a one-sweep flicker is not even shown
         atick(false, nodes: 219, step: 1)
-        results.append(hidden && axm.states[0] == .done ? "PASS 状态·抖动不抹掉未看的章" : "FAIL 状态·抖动不抹掉未看的章")
+        results.append(untouched && axm.states[0] == .done ? "PASS 状态·抖动不抹掉未看的章" : "FAIL 状态·抖动不抹掉未看的章")
 
         // ---- three-valued reading: busy / finished / UNKNOWN -------------------
         // The bug this pins: an Electron AX tree comes back partial while the app
@@ -161,7 +164,7 @@ extension AppDelegate {
             vm.applyAX([0: r], now: vNow)
         }
         let sess = "可用工具检查"
-        vtick(.init(nodes: 90, running: [sess]))
+        vtick(.init(nodes: 90, running: [sess])); vtick(.init(nodes: 90, running: [sess]))
         results.append(vm.states[0] == .working ? "PASS 状态·会话行在跑→工作中" : "FAIL 状态·会话行在跑→工作中")
         // the tree loses the row mid-turn (exactly what the log showed at 03:04:21)
         for _ in 0..<6 { vtick(.init(nodes: 219, complete: false)) }
@@ -183,7 +186,7 @@ extension AppDelegate {
             wNow = wNow.addingTimeInterval(step)
             wm.applyAX([0: r], now: wNow)
         }
-        wtick(.init(nodes: 90, running: [sess]))
+        wtick(.init(nodes: 90, running: [sess])); wtick(.init(nodes: 90, running: [sess]))
         for _ in 0..<5 { wtick(.init(nodes: 219, complete: false)) }
         let stillHeld = wm.states[0] == .working
         for _ in 0..<8 { wtick(.init(nodes: 219, complete: false)) }
@@ -194,8 +197,7 @@ extension AppDelegate {
         qm.dirPath = NSTemporaryDirectory() + "nd-quit-selftest-\(ProcessInfo.processInfo.processIdentifier)"
         qm.frontmostBundlePath = { "/nonexistent" }
         var qNow = Date(timeIntervalSince1970: 7_000_000)
-        qNow = qNow.addingTimeInterval(1)
-        qm.applyAX([0: .init(nodes: 90, running: [sess])], now: qNow)
+        for _ in 0..<2 { qNow = qNow.addingTimeInterval(1); qm.applyAX([0: .init(nodes: 90, running: [sess])], now: qNow) }
         let wasWorking = qm.states[0] == .working
         qm.targetTerminated(0, pid: nil)
         results.append(wasWorking && qm.states[0] == nil ? "PASS 状态·退出即清除" : "FAIL 状态·退出即清除")
@@ -205,8 +207,7 @@ extension AppDelegate {
         tm2.dirPath = NSTemporaryDirectory() + "nd-trust-selftest-\(ProcessInfo.processInfo.processIdentifier)"
         tm2.frontmostBundlePath = { "/nonexistent" }
         var tNow = Date(timeIntervalSince1970: 8_000_000)
-        tNow = tNow.addingTimeInterval(1)
-        tm2.applyAX([0: .init(nodes: 90, running: [sess])], now: tNow)
+        for _ in 0..<2 { tNow = tNow.addingTimeInterval(1); tm2.applyAX([0: .init(nodes: 90, running: [sess])], now: tNow) }
         let heldBefore = tm2.states[0] == .working
         tm2.forgetAX(0)
         tm2.applyAX([Int: StatusMonitor.AXRead](), now: tNow.addingTimeInterval(1))
@@ -261,32 +262,24 @@ extension AppDelegate {
         results.append(fd[2] == 300 && fd[0] == 30
             ? "PASS 网络·跨读边界的多字节字符不丢行" : "FAIL 网络·跨读边界的多字节字符不丢行 \(fd)")
 
-        // the working/quiet state machine, driven by injected byte counts
+        // The network NEVER starts a turn. Measured over three working hours, 27 of
+        // its 28 solo episodes had no turn behind them (Cursor syncing, ChatGPT
+        // phoning home) and it minted twelve false stamps on Cursor alone. However
+        // sustained the inflow, an app AX did not see begin a turn shows nothing.
         let xm = isolated()
         xm.dirPath = NSTemporaryDirectory() + "nd-net-selftest-\(ProcessInfo.processInfo.processIdentifier)"
         xm.frontmostBundlePath = { "/nonexistent" }   // target is backgrounded
         xm.netEnabled = true                           // isolated() turns it off; this test IS the network path
-        xm.netOnRate = 800; xm.netHotNeeded = 2; xm.netQuiet = 6; xm.minWorkForDone = 2
         var xNow = Date(timeIntervalSince1970: 13_000_000)
         func ntick(_ bytes: Int, _ step: TimeInterval = 1) {
             xNow = xNow.addingTimeInterval(step)
             xm.applyNet(now: xNow, bytesOverride: [0: bytes], dt: step)
             xm.publishForTest(now: xNow)
         }
-        ntick(3000); ntick(3000)                  // sustained inflow, 2 samples
-        results.append(xm.states[0] == .working ? "PASS 网络·持续入站→工作中" : "FAIL 网络·持续入站→工作中")
-        ntick(0); ntick(0); ntick(0); ntick(0); ntick(0); ntick(0); ntick(0)  // quiet past netQuiet
-        results.append(xm.states[0] == .done ? "PASS 网络·静默够久→收工" : "FAIL 网络·静默够久→收工")
-        // a single blip is not a turn
-        let ym = isolated()
-        ym.dirPath = NSTemporaryDirectory() + "nd-net2-selftest-\(ProcessInfo.processInfo.processIdentifier)"
-        ym.frontmostBundlePath = { "/nonexistent" }
-        ym.netEnabled = true
-        ym.netOnRate = 800; ym.netHotNeeded = 2
-        var yNow = Date(timeIntervalSince1970: 14_000_000)
-        yNow = yNow.addingTimeInterval(1); ym.applyNet(now: yNow, bytesOverride: [0: 5000], dt: 1); ym.publishForTest(now: yNow)
-        yNow = yNow.addingTimeInterval(1); ym.applyNet(now: yNow, bytesOverride: [0: 0], dt: 1); ym.publishForTest(now: yNow)
-        results.append(ym.states[0] == nil ? "PASS 网络·单次脉冲不误报" : "FAIL 网络·单次脉冲不误报")
+        for _ in 0..<30 { ntick(50_000) }             // half a minute of heavy inflow, no AX turn behind it
+        results.append(xm.states[0] == nil ? "PASS 网络·没有 AX 起头的流量不算在跑" : "FAIL 网络·没有 AX 起头的流量不算在跑")
+        for _ in 0..<70 { ntick(0) }
+        results.append(xm.states[0] == nil ? "PASS 网络·流量停了也不凭空盖章" : "FAIL 网络·流量停了也不凭空盖章")
         // One app, several sessions. The probe used to stop at the first live row, so
         // whichever one finished first stamped ✓ for the whole app while the others
         // were still going — measured live with two Claude sessions running.
@@ -313,6 +306,43 @@ extension AppDelegate {
         results.append(mm.states[0] == .done ? "PASS 多会话·全部收工才盖章" : "FAIL 多会话·全部收工才盖章")
         mm.clearDone(kTargets[0])
         results.append((mm.sessions[0] ?? []).isEmpty ? "PASS 多会话·确认后清空明细" : "FAIL 多会话·确认后清空明细")
+        // Three tasks in one app: two finish, one keeps going. Jumping to ONE finished
+        // row acknowledges that row alone — the other ✓ stays, the working one is
+        // untouched, and the app keeps its spinner. (Measured complaint: clicking the
+        // finished task did nothing, because only the app as a whole could be cleared.)
+        let c = "会话丙"
+        mtick([a, b, c], []); mtick([a, b, c], []); mtick([a, b, c], [])
+        mtick([b], [a, c])
+        mm.acknowledge(kTargets[0], session: b)            // a working row: nothing happens
+        let bStill = mm.sessions[0]?.first { $0.name == b }?.state == .working
+        mm.acknowledge(kTargets[0], session: a)
+        let aGone = mm.sessions[0]?.contains { $0.name == a } == false
+        let cKept = mm.sessions[0]?.first { $0.name == c }?.state == .done
+        results.append(bStill && aGone && cKept && mm.states[0] == .working
+            ? "PASS 多会话·点掉一个完成的，其余不动" : "FAIL 多会话·点掉一个完成的，其余不动(\(bStill),\(aGone),\(cKept),\(String(describing: mm.states[0])))")
+        // Sitting with the finished session open in the frontmost app is seeing it too:
+        // the web area names the open session, and after doneLinger that row goes.
+        mm.doneLinger = 3
+        mm.frontmostBundlePath = { kTargets[0].path }
+        func otickC() {
+            mNow2 = mNow2.addingTimeInterval(1)
+            mm.applyAX([0: .init(nodes: 90, running: [b], settled: [c], openSession: c, openBusy: false, openChecked: true)], now: mNow2)
+        }
+        otickC(); otickC()
+        let cStillThere = mm.sessions[0]?.contains { $0.name == c } == true   // 2 s: not yet
+        otickC(); otickC()
+        results.append(cStillThere && mm.sessions[0]?.contains { $0.name == c } == false && mm.states[0] == .working
+            ? "PASS 多会话·打开着看够几秒的那行自动消" : "FAIL 多会话·打开着看够几秒的那行自动消")
+        mm.frontmostBundlePath = { "/nonexistent" }
+        // All finished: acknowledging one leaves the app's stamp for the one still unseen
+        mtick([], [b])
+        let appDone = mm.states[0] == .done
+        mtick([a], []); mtick([a], []); mtick([a], []); mtick([], [a])   // a runs again and finishes: two ✓ rows
+        mm.acknowledge(kTargets[0], session: b)
+        let stampKept = mm.states[0] == .done && mm.sessions[0]?.count == 1
+        mm.acknowledge(kTargets[0], session: a)
+        results.append(appDone && stampKept && mm.states[0] == nil && (mm.sessions[0] ?? []).isEmpty
+            ? "PASS 多会话·最后一个也看过了才收章" : "FAIL 多会话·最后一个也看过了才收章(\(appDone),\(stampKept),\(String(describing: mm.states[0])))")
         // The file protocol had the identical bug: one file per app meant whichever
         // session finished first wrote "done" over the fact that another was working.
         let fm2 = isolated()
@@ -395,6 +425,7 @@ extension AppDelegate {
         om.clearDone(kTargets[0])
         let bg = "后台会话"
         otick(.init(nodes: 90, running: [bg], settled: [open], openSession: open, openBusy: false, openChecked: true))
+        otick(.init(nodes: 90, running: [bg], settled: [open], openSession: open, openBusy: false, openChecked: true))
         results.append(om.states[0] == .working ? "PASS 回合·后台会话仍看侧边栏" : "FAIL 回合·后台会话仍看侧边栏")
         try? FileManager.default.removeItem(atPath: fm2.dirPath)
         // a stamp must stay on screen long enough to be seen, even if you never left
@@ -452,19 +483,24 @@ extension AppDelegate {
         func dtick(_ r: StatusMonitor.AXRead, _ step: TimeInterval = 1) {
             dNow = dNow.addingTimeInterval(step); dm.applyAX([0: r], now: dNow)
         }
+        dm.netEnabled = true; dm.netQuiet = 60
         dtick(.init(nodes: 90, running: [sess])); dtick(.init(nodes: 90, running: [sess]))
         for _ in 0..<5 { dtick(.init(nodes: 1, complete: true)) }     // torn down, 5 s in
         let ridden = dm.states[0] == .working
         for _ in 0..<10 { dtick(.init(nodes: 1, complete: true)) }    // 15 s dark: past the TTL
-        results.append(ridden && dm.states[0] == nil && (dm.sessions[0] ?? []).isEmpty
-            ? "PASS 状态·AX树被拆后不再卡住转圈" : "FAIL 状态·AX树被拆后不再卡住转圈(\(ridden),\(String(describing: dm.states[0])))")
-        // …and the network fallback is then allowed to take the app over
-        dm.netEnabled = true
-        dNow = dNow.addingTimeInterval(1); dm.applyNet(now: dNow, bytesOverride: [0: 5000], dt: 1); dm.publishForTest(now: dNow)
-        dNow = dNow.addingTimeInterval(1); dm.applyNet(now: dNow, bytesOverride: [0: 5000], dt: 1); dm.publishForTest(now: dNow)
-        results.append(dm.states[0] == .working ? "PASS 状态·AX放手后网络信号接管" : "FAIL 状态·AX放手后网络信号接管")
-        // The app quits while the network signal says working: no spinner, and no ✓
-        // that nothing could ever dismiss.
+        // AX has let go — but the turn it was watching is handed to the network, not dropped
+        let handed = dm.states[0] == .working && (dm.sessions[0] ?? []).first?.state == .working
+        results.append(ridden && handed
+            ? "PASS 状态·AX树被拆后回合交给网络续上" : "FAIL 状态·AX树被拆后回合交给网络续上(\(ridden),\(String(describing: dm.states[0])))")
+        // bytes keep it alive; a tool call's silence does not end it…
+        for _ in 0..<10 { dNow = dNow.addingTimeInterval(1); dm.applyNet(now: dNow, bytesOverride: [0: 5000], dt: 1); dm.publishForTest(now: dNow) }
+        for _ in 0..<30 { dNow = dNow.addingTimeInterval(1); dm.applyNet(now: dNow, bytesOverride: [0: 0], dt: 1); dm.publishForTest(now: dNow) }
+        let heldThroughTool = dm.states[0] == .working
+        // …a full minute of silence does, with the stamp AX would have minted
+        for _ in 0..<35 { dNow = dNow.addingTimeInterval(1); dm.applyNet(now: dNow, bytesOverride: [0: 0], dt: 1); dm.publishForTest(now: dNow) }
+        results.append(heldThroughTool && dm.states[0] == .done && (dm.sessions[0] ?? []).first?.state == .done
+            ? "PASS 状态·接管后静默满一分钟才收工盖章" : "FAIL 状态·接管后静默满一分钟才收工盖章(\(heldThroughTool),\(String(describing: dm.states[0])))")
+        // The app quits while a ✓ is pending: no stamp that nothing could ever dismiss.
         dm.targetTerminated(0, pid: nil)
         dNow = dNow.addingTimeInterval(10); dm.applyNet(now: dNow, bytesOverride: [0: 0], dt: 1); dm.publishForTest(now: dNow)
         results.append(dm.states[0] == nil ? "PASS 状态·退出的 app 不留网络残影" : "FAIL 状态·退出的 app 不留网络残影 \(String(describing: dm.states[0]))")

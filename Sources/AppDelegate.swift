@@ -436,6 +436,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 _ = AXStatus.press(pid: pid, name: session)
             }
         }
+        // Clicking a finished row IS seeing it. Only that row: the app's other
+        // finished sessions have not been looked at, and a session still working
+        // is not touched at all.
+        statusMon.acknowledge(t, session: session)
         state.showCard = false
         panel?.ignoresMouseEvents = true
     }
